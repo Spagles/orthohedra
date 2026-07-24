@@ -105,6 +105,20 @@ body {
   accent-color: var(--accent);
 }
 
+.file-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--outline);
+}
+
+.file-actions .mode-btn {
+  font-size: 0.8rem;
+  padding: 5px 8px;
+}
+
 #status {
   margin: 0;
   color: var(--muted);

@@ -14,6 +14,9 @@ const statusEl = document.getElementById('status');
 const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
 const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
+const saveBtn = document.getElementById('saveBtn');
+const saveAsBtn = document.getElementById('saveAsBtn');
+const loadBtn = document.getElementById('loadBtn');
 
 async function main() {
   const scene = new THREE.Scene();
@@ -268,23 +271,22 @@ async function main() {
   const STORAGE_KEY = 'cubes-editor:state';
   const RENDER_MODES = new Set(['normal', 'no-red', 'no-yellow', 'no-blue']);
 
-  function saveToLocalStorage() {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
+  function currentStateJSON() {
+    return JSON.stringify(
+      {
         positions,
         renderMode: currentRenderMode,
         camera: {
           position: camera.position.toArray(),
           target: controls.target.toArray(),
         },
-      })
+      },
+      null,
+      2
     );
   }
 
-  function loadFromLocalStorage() {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
+  function parseSavedState(raw) {
     try {
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object') return null;
@@ -312,6 +314,128 @@ async function main() {
     } catch {
       return null;
     }
+  }
+
+  function saveToLocalStorage() {
+    localStorage.setItem(STORAGE_KEY, currentStateJSON());
+  }
+
+  function loadFromLocalStorage() {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? parseSavedState(raw) : null;
+  }
+
+  // File save/load: uses the File System Access API when available (so a
+  // plain "Save" after the first "Save As…"/"Load…" writes straight back
+  // to the same file without re-prompting); falls back to a download-link
+  // trigger and a hidden file input on browsers that lack it (e.g. Safari,
+  // Firefox).
+  const hasFileSystemAccess = 'showSaveFilePicker' in window && 'showOpenFilePicker' in window;
+  let fileHandle = null;
+
+  async function writeToFileHandle(handle) {
+    const writable = await handle.createWritable();
+    await writable.write(currentStateJSON());
+    await writable.close();
+  }
+
+  async function saveAs() {
+    if (hasFileSystemAccess) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: 'cubes.json',
+          types: [{ description: 'Cubes Editor JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        await writeToFileHandle(handle);
+        fileHandle = handle;
+      } catch (error) {
+        if (error?.name !== 'AbortError') console.error('Save As failed:', error);
+      }
+      return;
+    }
+
+    const blob = new Blob([currentStateJSON()], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'cubes.json';
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function save() {
+    if (hasFileSystemAccess && fileHandle) {
+      try {
+        await writeToFileHandle(fileHandle);
+        return;
+      } catch (error) {
+        console.error('Save failed, falling back to Save As:', error);
+      }
+    }
+    await saveAs();
+  }
+
+  function applyLoadedState(state) {
+    if (!state) return;
+
+    for (const { x, y, z } of [...positions]) removeVoxel(x, y, z);
+    for (const { x, y, z } of state.positions) addVoxel(x, y, z);
+
+    const radio = [...renderModeInputs].find((input) => input.value === state.renderMode);
+    if (radio) radio.checked = true;
+    setRenderMode(state.renderMode);
+
+    if (state.camera) {
+      camera.position.fromArray(state.camera.position);
+      controls.target.fromArray(state.camera.target);
+      controls.update();
+    }
+
+    updateStatus(mode);
+    saveToLocalStorage();
+  }
+
+  let fileInput = null;
+
+  async function load() {
+    if (hasFileSystemAccess) {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: 'Cubes Editor JSON', accept: { 'application/json': ['.json'] } }],
+        });
+        const file = await handle.getFile();
+        const state = parseSavedState(await file.text());
+        if (!state) {
+          console.error('Load failed: file is not a valid cubes-editor save.');
+          return;
+        }
+        fileHandle = handle;
+        applyLoadedState(state);
+      } catch (error) {
+        if (error?.name !== 'AbortError') console.error('Load failed:', error);
+      }
+      return;
+    }
+
+    if (!fileInput) {
+      fileInput = document.createElement('input');
+      fileInput.type = 'file';
+      fileInput.accept = 'application/json';
+      fileInput.style.display = 'none';
+      document.body.appendChild(fileInput);
+      fileInput.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        const state = parseSavedState(await file.text());
+        if (!state) {
+          console.error('Load failed: file is not a valid cubes-editor save.');
+          return;
+        }
+        applyLoadedState(state);
+      });
+    }
+    fileInput.click();
   }
 
   function key(x, y, z) {
@@ -443,6 +567,10 @@ async function main() {
 
   buildBtn.addEventListener('click', () => setMode('build'));
   destroyBtn.addEventListener('click', () => setMode('destroy'));
+
+  saveBtn.addEventListener('click', () => save());
+  saveAsBtn.addEventListener('click', () => saveAs());
+  loadBtn.addEventListener('click', () => load());
 
   renderModeInputs.forEach((input) => {
     input.addEventListener('change', () => {
