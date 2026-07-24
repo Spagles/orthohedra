@@ -167,13 +167,24 @@
       const hemiLight = new THREE.HemisphereLight(0xa8c7ff, 0x1f2a3f, 0.55);
       scene.add(hemiLight);
 
+      // Attached to the camera (rather than the scene) so they move with
+      // the viewer as the camera orbits, instead of staying fixed in world
+      // space. A DirectionalLight shines toward `target`, which defaults
+      // to the world origin — parent the target to the camera too (at its
+      // local look-at point) so the light direction stays camera-relative.
       const keyLight = new THREE.DirectionalLight(0xfff2dd, 1.2);
       keyLight.position.set(6, 9, 4);
-      scene.add(keyLight);
+      camera.add(keyLight);
+      camera.add(keyLight.target);
+      keyLight.target.position.set(0, 0, -1);
 
       const fillLight = new THREE.DirectionalLight(0xa8d7ff, 0.45);
       fillLight.position.set(-5, 3, -7);
-      scene.add(fillLight);
+      camera.add(fillLight);
+      camera.add(fillLight.target);
+      fillLight.target.position.set(0, 0, -1);
+
+      scene.add(camera);
 
       const bounds = new THREE.Box3(
         new THREE.Vector3(MIN - 0.5, MIN - 0.5, MIN - 0.5),
@@ -201,6 +212,77 @@
       hoverOutline.visible = false;
       scene.add(hoverOutline);
 
+      // Brink skeleton rendering: white spheres at vertices, and
+      // cylinders for edges colored red/yellow/blue by their X/Y/Z axis.
+      const SKELETON_VERTEX_RADIUS = (0.125 / 2) * 1.6; // diameter 1/8 of a cube edge, scaled 60% larger
+      const SKELETON_EDGE_RADIUS = SKELETON_VERTEX_RADIUS * 0.4; // halved back down from the previous 2x
+
+      const skeletonVertexGeometry = new THREE.SphereGeometry(SKELETON_VERTEX_RADIUS, 12, 8);
+      const skeletonVertexMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+      const skeletonVertexMesh = new THREE.InstancedMesh(skeletonVertexGeometry, skeletonVertexMaterial, MAX_INSTANCES);
+      skeletonVertexMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      skeletonVertexMesh.frustumCulled = false;
+      skeletonVertexMesh.count = 0;
+      scene.add(skeletonVertexMesh);
+
+      // Unit-height cylinder along Y; scaled/rotated/positioned per edge.
+      const skeletonEdgeGeometry = new THREE.CylinderGeometry(SKELETON_EDGE_RADIUS, SKELETON_EDGE_RADIUS, 1, 8);
+      const AXIS_COLORS = [0xff3b30, 0xffd60a, 0x0a84ff]; // X: red, Y: yellow, Z: blue
+      const skeletonEdgeMeshes = AXIS_COLORS.map((color) => {
+        const material = new THREE.MeshStandardMaterial({ color, roughness: 0.5 });
+        const mesh = new THREE.InstancedMesh(skeletonEdgeGeometry, material, MAX_INSTANCES);
+        mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        mesh.frustumCulled = false;
+        mesh.count = 0;
+        scene.add(mesh);
+        return mesh;
+      });
+
+      const skeletonTempMatrix = new THREE.Matrix4();
+      const skeletonEdgeQuaternions = [
+        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -Math.PI / 2), // Y-cylinder -> X
+        new THREE.Quaternion(), // Y-cylinder -> Y (identity)
+        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2), // Y-cylinder -> Z
+      ];
+
+      function renderBrinkSkeleton(skeleton) {
+        skeletonVertexMesh.count = skeleton.vertices.length;
+        for (let i = 0; i < skeleton.vertices.length; i++) {
+          const [x, y, z] = skeleton.vertices[i];
+          skeletonTempMatrix.makeTranslation(x, y, z);
+          skeletonVertexMesh.setMatrixAt(i, skeletonTempMatrix);
+        }
+        skeletonVertexMesh.instanceMatrix.needsUpdate = true;
+
+        const edgesByAxis = [[], [], []];
+        for (const [vi, vj] of skeleton.edges) {
+          const a = skeleton.vertices[vi];
+          const b = skeleton.vertices[vj];
+          const axis = a[0] !== b[0] ? 0 : a[1] !== b[1] ? 1 : 2;
+          edgesByAxis[axis].push([a, b]);
+        }
+
+        for (let axis = 0; axis < 3; axis++) {
+          const mesh = skeletonEdgeMeshes[axis];
+          const axisEdges = edgesByAxis[axis];
+          mesh.count = axisEdges.length;
+          for (let i = 0; i < axisEdges.length; i++) {
+            const [a, b] = axisEdges[i];
+            const length = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+            const midX = (a[0] + b[0]) / 2;
+            const midY = (a[1] + b[1]) / 2;
+            const midZ = (a[2] + b[2]) / 2;
+            skeletonTempMatrix.compose(
+              new THREE.Vector3(midX, midY, midZ),
+              skeletonEdgeQuaternions[axis],
+              new THREE.Vector3(1, length, 1)
+            );
+            mesh.setMatrixAt(i, skeletonTempMatrix);
+          }
+          mesh.instanceMatrix.needsUpdate = true;
+        }
+      }
+
       const occupied = new Map();
       const positions = [];
       const tempMatrix = new THREE.Matrix4();
@@ -224,6 +306,7 @@
       function updateBrinkSkeleton() {
         const skeleton = computeBrinkSkeleton(positions);
         logBrinkSkeleton(skeleton);
+        renderBrinkSkeleton(skeleton);
       }
 
       function addVoxel(x, y, z) {
