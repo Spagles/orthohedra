@@ -187,8 +187,10 @@ async function main() {
   // hides that one axis's edges, so the remaining brink skeleton is
   // easier to see through the cube volume.
   const AXIS_INDEX_BY_HIDDEN_COLOR = { 'no-red': 0, 'no-yellow': 1, 'no-blue': 2 };
+  let currentRenderMode = 'normal';
 
   function setRenderMode(mode) {
+    currentRenderMode = mode;
     const hiddenAxis = AXIS_INDEX_BY_HIDDEN_COLOR[mode];
     for (let axis = 0; axis < 3; axis++) {
       skeletonEdgeMeshes[axis].visible = axis !== hiddenAxis;
@@ -260,6 +262,55 @@ async function main() {
   const occupied = new Map();
   const positions = [];
 
+  const STORAGE_KEY = 'cubes-editor:state';
+  const RENDER_MODES = new Set(['normal', 'no-red', 'no-yellow', 'no-blue']);
+
+  function saveToLocalStorage() {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        positions,
+        renderMode: currentRenderMode,
+        camera: {
+          position: camera.position.toArray(),
+          target: controls.target.toArray(),
+        },
+      })
+    );
+  }
+
+  function loadFromLocalStorage() {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+
+      const positions = Array.isArray(parsed.positions)
+        ? parsed.positions.filter(
+            (p) =>
+              p &&
+              Number.isInteger(p.x) &&
+              Number.isInteger(p.y) &&
+              Number.isInteger(p.z) &&
+              inBounds(p.x, p.y, p.z)
+          )
+        : [];
+
+      const renderMode = RENDER_MODES.has(parsed.renderMode) ? parsed.renderMode : 'normal';
+
+      const isVector3Array = (v) => Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n));
+      const cameraState =
+        parsed.camera && isVector3Array(parsed.camera.position) && isVector3Array(parsed.camera.target)
+          ? parsed.camera
+          : null;
+
+      return { positions, renderMode, camera: cameraState };
+    } catch {
+      return null;
+    }
+  }
+
   function key(x, y, z) {
     return `${x},${y},${z}`;
   }
@@ -281,6 +332,7 @@ async function main() {
     logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
     renderBoundaryCubeFaces(positions);
+    saveToLocalStorage();
   }
 
   function addVoxel(x, y, z) {
@@ -314,8 +366,30 @@ async function main() {
     return true;
   }
 
-  // Initial cube centered in a 49x49x49 build volume.
-  addVoxel(0, 0, 0);
+  // Restore previously saved state, if any: render mode and camera first
+  // (so the position-restoring addVoxel calls below, which each trigger a
+  // save, re-persist the already-correct values instead of clobbering
+  // them with defaults), then the assembly itself. With nothing saved,
+  // fall back to a single cube centered in the 49x49x49 build volume.
+  const saved = loadFromLocalStorage();
+
+  if (saved?.camera) {
+    camera.position.fromArray(saved.camera.position);
+    controls.target.fromArray(saved.camera.target);
+    controls.update();
+  }
+
+  const radioForMode = (mode) => [...renderModeInputs].find((input) => input.value === mode);
+  const initialRenderMode = saved?.renderMode ?? 'normal';
+  const initialRadio = radioForMode(initialRenderMode);
+  if (initialRadio) initialRadio.checked = true;
+  setRenderMode(initialRenderMode);
+
+  if (saved?.positions?.length) {
+    for (const { x, y, z } of saved.positions) addVoxel(x, y, z);
+  } else {
+    addVoxel(0, 0, 0);
+  }
 
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
@@ -369,7 +443,10 @@ async function main() {
 
   renderModeInputs.forEach((input) => {
     input.addEventListener('change', () => {
-      if (input.checked) setRenderMode(input.value);
+      if (input.checked) {
+        setRenderMode(input.value);
+        saveToLocalStorage();
+      }
     });
   });
 
@@ -406,7 +483,15 @@ async function main() {
   });
 
   updateStatus(mode);
-  setRenderMode('normal');
+
+  // OrbitControls fires "change" continuously while dragging or during
+  // damped inertial settling — debounce so camera moves don't spam
+  // localStorage writes on every frame, only once motion has settled.
+  let cameraSaveTimeout = null;
+  controls.addEventListener('change', () => {
+    clearTimeout(cameraSaveTimeout);
+    cameraSaveTimeout = setTimeout(saveToLocalStorage, 300);
+  });
 
   renderer.setAnimationLoop(() => {
     controls.update();
