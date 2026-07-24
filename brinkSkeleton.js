@@ -42,6 +42,36 @@ function pointKey(p) {
 }
 
 /**
+ * Compute the boundary (non-internal) unit faces of a cube assembly: one
+ * entry per cube face that does not directly adjoin another cube (i.e.
+ * every face except those sandwiched between two present cubes).
+ * @param {Array<{x:number,y:number,z:number}>} cubes - integer cube centers
+ * @returns {Array<{ cubeIndex: number, axis: number, sign: number, center: [number,number,number] }>}
+ */
+export function computeBoundaryCubeFaces(cubes) {
+  const occupiedSet = new Set(cubes.map(({ x, y, z }) => `${x},${y},${z}`));
+  function hasCube(x, y, z) {
+    return occupiedSet.has(`${x},${y},${z}`);
+  }
+
+  const boundaryFaces = [];
+  for (let cubeIndex = 0; cubeIndex < cubes.length; cubeIndex++) {
+    const { x, y, z } = cubes[cubeIndex];
+    for (const axis of AXES) {
+      for (const sign of [-1, 1]) {
+        const n = [x, y, z];
+        n[axis] += sign;
+        if (hasCube(n[0], n[1], n[2])) continue; // internal face between two present cubes
+        const center = [x, y, z];
+        center[axis] += sign / 2;
+        boundaryFaces.push({ cubeIndex, axis, sign, center });
+      }
+    }
+  }
+  return boundaryFaces;
+}
+
+/**
  * Compute the brink skeleton of a cube assembly.
  * @param {Array<{x:number,y:number,z:number}>} cubes - integer cube centers
  * @returns {{

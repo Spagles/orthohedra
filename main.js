@@ -1,6 +1,6 @@
 import * as THREE from "https://esm.sh/three@0.172.0";
 import { OrbitControls } from "https://esm.sh/three@0.172.0/examples/jsm/controls/OrbitControls.js";
-import { computeBrinkSkeleton, logBrinkSkeleton } from "./brinkSkeleton.js";
+import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
 
 const SIZE = 49;
 const HALF = Math.floor(SIZE / 2);
@@ -69,23 +69,89 @@ async function main() {
   grid.position.y = MIN - 0.5;
   scene.add(grid);
 
-  const cubeGeometry = new THREE.BoxGeometry(1, 1, 1);
-  const cubeMaterial = new THREE.MeshStandardMaterial({
-    color: 0x57d6a5,
-    roughness: 0.64,
-    metalness: 0.05,
-    transparent: true,
-    opacity: 1,
+  // Boundary cube faces: one unit quad per non-internal cube face (every
+  // face except those sandwiched between two present cubes) — replaces
+  // rendering whole green cubes. Faces are split into 3 meshes by their
+  // normal axis (X/Y/Z) so each orientation's transparency can be
+  // controlled independently: hiding one axis's skeleton edges (e.g. "no
+  // red") should only make transparent the faces that LIE IN a plane
+  // containing that axis (Y- and Z-normal faces, i.e. red-yellow and
+  // red-blue planes) — the faces perpendicular to that axis (X-normal,
+  // lying in the yellow-blue plane) stay solid.
+  const FACE_MAX_INSTANCES = MAX_INSTANCES * 2; // at most 2 boundary faces per cube per axis
+  const faceGeometry = new THREE.PlaneGeometry(1, 1);
+  const cubeFaceMaterials = [0, 1, 2].map(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: 0x57d6a5,
+        roughness: 0.64,
+        metalness: 0.05,
+        transparent: true,
+        opacity: 1,
+        side: THREE.DoubleSide,
+      })
+  );
+  const cubeFaceMeshes = cubeFaceMaterials.map((material) => {
+    const mesh = new THREE.InstancedMesh(faceGeometry, material, FACE_MAX_INSTANCES);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.frustumCulled = false;
+    mesh.count = 0;
+    scene.add(mesh);
+    return mesh;
   });
-  const voxels = new THREE.InstancedMesh(cubeGeometry, cubeMaterial, MAX_INSTANCES);
-  voxels.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  voxels.frustumCulled = false;
-  voxels.count = 0;
-  scene.add(voxels);
+
+  // Per-instance metadata for the current boundary faces, one array per
+  // axis mesh, indexed the same as that mesh's instances.
+  let boundaryFaceInfoByAxis = [[], [], []];
+
+  const faceTempMatrix = new THREE.Matrix4();
+  const faceQuaternions = [
+    [ // axis 0 (X): rotate the plane (default facing +Z) to face +X / -X
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2),
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2),
+    ],
+    [ // axis 1 (Y): rotate to face +Y / -Y
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2),
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2),
+    ],
+    [ // axis 2 (Z): rotate to face +Z / -Z (identity / 180°)
+      new THREE.Quaternion(),
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI),
+    ],
+  ];
+
+  function renderBoundaryCubeFaces(cubePositions) {
+    const boundaryFaces = computeBoundaryCubeFaces(cubePositions);
+    const byAxis = [[], [], []];
+    for (const face of boundaryFaces) byAxis[face.axis].push(face);
+    boundaryFaceInfoByAxis = byAxis;
+
+    for (let axis = 0; axis < 3; axis++) {
+      const mesh = cubeFaceMeshes[axis];
+      const axisFaces = byAxis[axis];
+      mesh.count = axisFaces.length;
+      for (let i = 0; i < axisFaces.length; i++) {
+        const { sign, center } = axisFaces[i];
+        const signIdx = sign === 1 ? 0 : 1;
+        faceTempMatrix.compose(
+          new THREE.Vector3(center[0], center[1], center[2]),
+          faceQuaternions[axis][signIdx],
+          new THREE.Vector3(1, 1, 1)
+        );
+        mesh.setMatrixAt(i, faceTempMatrix);
+      }
+      mesh.instanceMatrix.needsUpdate = true;
+      // InstancedMesh caches a bounding sphere for raycasting that isn't
+      // automatically invalidated when instances move or `count`
+      // changes — recompute it here or hover/click detection can
+      // intermittently miss instances outside the stale bounds.
+      mesh.computeBoundingSphere();
+    }
+  }
 
   const hoverOutline = new THREE.Mesh(
-    new THREE.BoxGeometry(1.02, 1.02, 1.02),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true })
+    new THREE.PlaneGeometry(1.02, 1.02),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, side: THREE.DoubleSide })
   );
   hoverOutline.visible = false;
   scene.add(hoverOutline);
@@ -124,9 +190,14 @@ async function main() {
 
   function setRenderMode(mode) {
     const hiddenAxis = AXIS_INDEX_BY_HIDDEN_COLOR[mode];
-    cubeMaterial.opacity = hiddenAxis === undefined ? 1 : 0.5;
     for (let axis = 0; axis < 3; axis++) {
       skeletonEdgeMeshes[axis].visible = axis !== hiddenAxis;
+      // A face's plane contains the hidden axis unless the face's own
+      // normal IS that axis — e.g. hiding red (X) leaves X-normal faces
+      // (the yellow-blue plane) solid, and makes Y-normal/Z-normal faces
+      // (red-blue and red-yellow planes) transparent.
+      const faceContainsHiddenAxis = hiddenAxis !== undefined && axis !== hiddenAxis;
+      cubeFaceMaterials[axis].opacity = faceContainsHiddenAxis ? 0.5 : 1;
     }
   }
 
@@ -177,7 +248,6 @@ async function main() {
 
   const occupied = new Map();
   const positions = [];
-  const tempMatrix = new THREE.Matrix4();
 
   function key(x, y, z) {
     return `${x},${y},${z}`;
@@ -199,6 +269,7 @@ async function main() {
     const skeleton = computeBrinkSkeleton(positions);
     logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
+    renderBoundaryCubeFaces(positions);
   }
 
   function addVoxel(x, y, z) {
@@ -209,12 +280,6 @@ async function main() {
     positions.push(pos);
     occupied.set(key(x, y, z), idx);
 
-    tempMatrix.makeTranslation(x, y, z);
-    voxels.setMatrixAt(idx, tempMatrix);
-    voxels.count = positions.length;
-    voxels.instanceMatrix.needsUpdate = true;
-    voxels.computeBoundingBox();
-    voxels.computeBoundingSphere();
     updateBrinkSkeleton();
     return true;
   }
@@ -230,16 +295,10 @@ async function main() {
     if (removeIdx !== lastIdx) {
       positions[removeIdx] = lastPos;
       occupied.set(key(lastPos.x, lastPos.y, lastPos.z), removeIdx);
-      tempMatrix.makeTranslation(lastPos.x, lastPos.y, lastPos.z);
-      voxels.setMatrixAt(removeIdx, tempMatrix);
     }
 
     positions.pop();
     occupied.delete(removeKey);
-    voxels.count = positions.length;
-    voxels.instanceMatrix.needsUpdate = true;
-    voxels.computeBoundingBox();
-    voxels.computeBoundingSphere();
     updateBrinkSkeleton();
     return true;
   }
@@ -249,9 +308,6 @@ async function main() {
 
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
-  const instanceMatrix = new THREE.Matrix4();
-  const hitCenter = new THREE.Vector3();
-  const localHit = new THREE.Vector3();
 
   let mode = 'build';
   let downX = 0;
@@ -264,29 +320,12 @@ async function main() {
     updateStatus(mode);
   }
 
-  function faceDirectionFromIntersection(intersection) {
-    const id = intersection.instanceId;
-    if (id === undefined || id === null) return null;
-
-    voxels.getMatrixAt(id, instanceMatrix);
-    hitCenter.setFromMatrixPosition(instanceMatrix);
-    localHit.copy(intersection.point).sub(hitCenter);
-
-    const ax = Math.abs(localHit.x);
-    const ay = Math.abs(localHit.y);
-    const az = Math.abs(localHit.z);
-
-    if (ax >= ay && ax >= az) return new THREE.Vector3(Math.sign(localHit.x), 0, 0);
-    if (ay >= ax && ay >= az) return new THREE.Vector3(0, Math.sign(localHit.y), 0);
-    return new THREE.Vector3(0, 0, Math.sign(localHit.z));
-  }
-
   function getIntersection(clientX, clientY) {
     const rect = renderer.domElement.getBoundingClientRect();
     pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(pointer, camera);
-    return raycaster.intersectObject(voxels, false);
+    return raycaster.intersectObjects(cubeFaceMeshes, false);
   }
 
   function handleEdit(clientX, clientY) {
@@ -297,23 +336,19 @@ async function main() {
     const id = hit.instanceId;
     if (id === undefined || id === null) return;
 
-    voxels.getMatrixAt(id, instanceMatrix);
-    hitCenter.setFromMatrixPosition(instanceMatrix);
-    const x = Math.round(hitCenter.x);
-    const y = Math.round(hitCenter.y);
-    const z = Math.round(hitCenter.z);
+    const axis = cubeFaceMeshes.indexOf(hit.object);
+    const info = boundaryFaceInfoByAxis[axis]?.[id];
+    if (!info) return;
+    const { x, y, z } = positions[info.cubeIndex];
 
     if (mode === 'destroy') {
       if (removeVoxel(x, y, z)) updateStatus(mode);
       return;
     }
 
-    const dir = faceDirectionFromIntersection(hit);
-    if (!dir) return;
-
-    const nx = x + dir.x;
-    const ny = y + dir.y;
-    const nz = z + dir.z;
+    const nx = x + (info.axis === 0 ? info.sign : 0);
+    const ny = y + (info.axis === 1 ? info.sign : 0);
+    const nz = z + (info.axis === 2 ? info.sign : 0);
 
     if (addVoxel(nx, ny, nz)) updateStatus(mode);
   }
@@ -339,9 +374,11 @@ async function main() {
       return;
     }
 
-    voxels.getMatrixAt(hits[0].instanceId, instanceMatrix);
-    hitCenter.setFromMatrixPosition(instanceMatrix);
-    hoverOutline.position.copy(hitCenter);
+    hits[0].object.getMatrixAt(hits[0].instanceId, hoverOutline.matrix);
+    hoverOutline.matrix.decompose(hoverOutline.position, hoverOutline.quaternion, hoverOutline.scale);
+    // Nudge along the face normal so the (coplanar) outline doesn't z-fight
+    // with the boundary face quad it's highlighting.
+    hoverOutline.translateZ(0.002);
     hoverOutline.visible = true;
   });
 
