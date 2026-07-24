@@ -1,5 +1,5 @@
 import * as THREE from "https://esm.sh/three@0.172.0";
-import { OrbitControls } from "https://esm.sh/three@0.172.0/examples/jsm/controls/OrbitControls.js";
+import { TrackballControls } from "https://esm.sh/three@0.172.0/examples/jsm/controls/TrackballControls.js";
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
 
 const SIZE = 49;
@@ -30,11 +30,14 @@ async function main() {
   renderer.toneMappingExposure = 1.0;
   app.appendChild(renderer.domElement);
 
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
+  const controls = new TrackballControls(camera, renderer.domElement);
   controls.target.set(0, 0, 0);
   controls.minDistance = 1.8;
   controls.maxDistance = 120;
+  controls.noPan = false;
+  controls.rotateSpeed = 3.5;
+  controls.zoomSpeed = 1.2;
+  controls.panSpeed = 0.8;
 
   const hemiLight = new THREE.HemisphereLight(0xa8c7ff, 0x1f2a3f, 0.55);
   scene.add(hemiLight);
@@ -480,6 +483,10 @@ async function main() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    // Unlike OrbitControls, TrackballControls caches the canvas's screen
+    // rect for its rotate/pan/zoom math and needs to be told explicitly
+    // when it changes, or dragging becomes misaligned with the cursor.
+    controls.handleResize();
   });
 
   updateStatus(mode);
