@@ -90,6 +90,28 @@
       background: rgba(255, 122, 107, 0.2);
     }
 
+    .render-modes {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--outline);
+    }
+
+    .render-modes label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .render-modes input {
+      accent-color: var(--accent);
+    }
+
     #status {
       margin: 0;
       color: var(--muted);
@@ -120,6 +142,12 @@
       <button class="mode-btn active" data-mode="build" id="buildBtn">Build</button>
       <button class="mode-btn" data-mode="destroy" id="destroyBtn">Destroy</button>
     </div>
+    <div class="render-modes" id="renderModes">
+      <label><input type="radio" name="renderMode" value="normal" checked> Normal</label>
+      <label><input type="radio" name="renderMode" value="no-red"> No red</label>
+      <label><input type="radio" name="renderMode" value="no-yellow"> No yellow</label>
+      <label><input type="radio" name="renderMode" value="no-blue"> No blue</label>
+    </div>
     <p id="status">Mode: Build<br>Cubes: 1</p>
   </div>
 
@@ -142,6 +170,7 @@
     const statusEl = document.getElementById('status');
     const buildBtn = document.getElementById('buildBtn');
     const destroyBtn = document.getElementById('destroyBtn');
+    const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
 
     async function main() {
       const scene = new THREE.Scene();
@@ -198,7 +227,13 @@
       scene.add(grid);
 
       const cubeGeometry = new THREE.BoxGeometry(1, 1, 1);
-      const cubeMaterial = new THREE.MeshStandardMaterial({ color: 0x57d6a5, roughness: 0.64, metalness: 0.05 });
+      const cubeMaterial = new THREE.MeshStandardMaterial({
+        color: 0x57d6a5,
+        roughness: 0.64,
+        metalness: 0.05,
+        transparent: true,
+        opacity: 1,
+      });
       const voxels = new THREE.InstancedMesh(cubeGeometry, cubeMaterial, MAX_INSTANCES);
       voxels.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       voxels.frustumCulled = false;
@@ -237,6 +272,20 @@
         scene.add(mesh);
         return mesh;
       });
+
+      // Render modes: "normal" shows opaque cubes and all three edge
+      // colors; each "no-X" mode makes the cubes 75% transparent and
+      // hides that one axis's edges, so the remaining brink skeleton is
+      // easier to see through the cube volume.
+      const AXIS_INDEX_BY_HIDDEN_COLOR = { 'no-red': 0, 'no-yellow': 1, 'no-blue': 2 };
+
+      function setRenderMode(mode) {
+        const hiddenAxis = AXIS_INDEX_BY_HIDDEN_COLOR[mode];
+        cubeMaterial.opacity = hiddenAxis === undefined ? 1 : 0.5;
+        for (let axis = 0; axis < 3; axis++) {
+          skeletonEdgeMeshes[axis].visible = axis !== hiddenAxis;
+        }
+      }
 
       const skeletonTempMatrix = new THREE.Matrix4();
       const skeletonEdgeQuaternions = [
@@ -429,6 +478,12 @@
       buildBtn.addEventListener('click', () => setMode('build'));
       destroyBtn.addEventListener('click', () => setMode('destroy'));
 
+      renderModeInputs.forEach((input) => {
+        input.addEventListener('change', () => {
+          if (input.checked) setRenderMode(input.value);
+        });
+      });
+
       renderer.domElement.addEventListener('pointerdown', (event) => {
         downX = event.clientX;
         downY = event.clientY;
@@ -460,6 +515,7 @@
       });
 
       updateStatus(mode);
+      setRenderMode('normal');
 
       renderer.setAnimationLoop(() => {
         controls.update();
