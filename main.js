@@ -197,7 +197,18 @@ async function main() {
       // (the yellow-blue plane) solid, and makes Y-normal/Z-normal faces
       // (red-blue and red-yellow planes) transparent.
       const faceContainsHiddenAxis = hiddenAxis !== undefined && axis !== hiddenAxis;
-      cubeFaceMaterials[axis].opacity = faceContainsHiddenAxis ? 0.5 : 1;
+      const material = cubeFaceMaterials[axis];
+      material.opacity = faceContainsHiddenAxis ? 0.2 : 1;
+      // A transparent material that still writes depth marks those pixels
+      // as occupied at its own (nearer) depth; solid geometry drawn
+      // afterward at a greater depth then fails the depth test there and
+      // never gets rasterized, making it vanish instead of showing
+      // through the transparent face. Only disable depth writes while
+      // actually transparent, and make sure the opaque axis mesh renders
+      // first (renderOrder 0) so its depth/color are already established
+      // before the transparent ones (renderOrder 1) blend on top of it.
+      material.depthWrite = !faceContainsHiddenAxis;
+      cubeFaceMeshes[axis].renderOrder = faceContainsHiddenAxis ? 1 : 0;
     }
   }
 
