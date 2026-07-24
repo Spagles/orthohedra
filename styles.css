@@ -1,0 +1,126 @@
+:root {
+  color-scheme: dark;
+  --bg-0: #0b1020;
+  --bg-1: #131a2f;
+  --panel: rgba(10, 14, 28, 0.82);
+  --text: #e6ecff;
+  --muted: #a9b4d8;
+  --accent: #57d6a5;
+  --accent-2: #ff7a6b;
+  --outline: rgba(158, 180, 255, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: radial-gradient(circle at 20% 10%, #18203e 0%, var(--bg-0) 55%, #070b16 100%);
+  color: var(--text);
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+#overlay {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--outline);
+  backdrop-filter: blur(8px);
+  user-select: none;
+  min-width: 220px;
+}
+
+#title {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.modes {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.mode-btn {
+  appearance: none;
+  border: 1px solid var(--outline);
+  border-radius: 8px;
+  background: #1b2444;
+  color: var(--text);
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: transform 0.1s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.mode-btn:hover {
+  transform: translateY(-1px);
+}
+
+.mode-btn.active[data-mode="build"] {
+  border-color: var(--accent);
+  background: rgba(87, 214, 165, 0.2);
+}
+
+.mode-btn.active[data-mode="destroy"] {
+  border-color: var(--accent-2);
+  background: rgba(255, 122, 107, 0.2);
+}
+
+.render-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--outline);
+}
+
+.render-modes label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.render-modes input {
+  accent-color: var(--accent);
+}
+
+#status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+#error {
+  position: fixed;
+  inset: 0;
+  display: none;
+  place-items: center;
+  text-align: center;
+  background: rgba(8, 10, 16, 0.94);
+  color: #ffd7d2;
+  padding: 24px;
+  z-index: 100;
+  font-size: 1rem;
+}
