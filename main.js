@@ -456,6 +456,35 @@ async function main() {
     statusEl.innerHTML = `Mode: ${mode === 'build' ? 'Build' : 'Destroy'}<br>Cubes: ${positions.length}`;
   }
 
+  // A graph is bipartite iff it has no odd-length cycle. 2-color each
+  // connected component by BFS; a conflict (neighbor wants the same color)
+  // means an odd cycle exists.
+  function isBipartite(vertexCount, edges) {
+    const adjacency = Array.from({ length: vertexCount }, () => []);
+    for (const [a, b] of edges) {
+      adjacency[a].push(b);
+      adjacency[b].push(a);
+    }
+    const color = new Array(vertexCount).fill(-1);
+    for (let start = 0; start < vertexCount; start++) {
+      if (color[start] !== -1) continue;
+      color[start] = 0;
+      const queue = [start];
+      while (queue.length > 0) {
+        const v = queue.shift();
+        for (const n of adjacency[v]) {
+          if (color[n] === -1) {
+            color[n] = 1 - color[v];
+            queue.push(n);
+          } else if (color[n] === color[v]) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   function updateBrinkSkeleton() {
     const skeleton = computeBrinkSkeleton(positions);
     logBrinkSkeleton(skeleton);
@@ -463,7 +492,10 @@ async function main() {
     const V = skeleton.vertices.length;
     const E = skeleton.edges.length;
     const F = skeleton.faces.length;
-    skeletonStatsEl.innerHTML = `Skeleton: V ${V}, E ${E}, F ${F}<br>Euler χ: ${V - E + F}`;
+    const bipartite = isBipartite(V, skeleton.edges);
+    skeletonStatsEl.innerHTML =
+      `Skeleton: V ${V}, E ${E}, F ${F}<br>Euler χ: ${V - E + F}<br>` +
+      `Orientable: ${bipartite ? 'yes' : 'no'}`;
     renderBoundaryCubeFaces(positions);
     saveToLocalStorage();
   }
