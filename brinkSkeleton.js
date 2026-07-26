@@ -18,20 +18,19 @@
 //     through it without ambiguity — no orientation/winding is needed
 //     anywhere in this construction.
 //
-// All lattice bookkeeping is done in "doubled" integer coordinates so
-// that cube centers and corners both land on integers:
-//   cube center (x, y, z)   -> doubled (2x,   2y,   2z)
-//   cube corner (x, y, z)   -> doubled (2x±1, 2y±1, 2z±1)
-// Output coordinates are converted back to real (unscaled) numbers.
+// Convention: a cube is identified by its LEAST corner (its minimum-x,y,z
+// corner) at integer coordinates. The unit cube with least corner (x,y,z)
+// occupies [x,x+1] x [y,y+1] x [z,z+1], so its 8 corners are the integer
+// points (x+dx, y+dy, z+dz) with dx,dy,dz in {0,1}. Skeleton vertices are
+// therefore plain integer lattice points — no doubling or half-integers.
 
 const AXES = [0, 1, 2];
 
-// The 8 corner offsets of a unit cube, in doubled coordinates relative to
-// the cube's doubled center.
+// The 8 corner offsets of a unit cube, relative to its least corner.
 const CORNER_OFFSETS = [];
-for (const dx of [-1, 1]) {
-  for (const dy of [-1, 1]) {
-    for (const dz of [-1, 1]) {
+for (const dx of [0, 1]) {
+  for (const dy of [0, 1]) {
+    for (const dz of [0, 1]) {
       CORNER_OFFSETS.push([dx, dy, dz]);
     }
   }
@@ -45,8 +44,9 @@ function pointKey(p) {
  * Compute the boundary (non-internal) unit faces of a cube assembly: one
  * entry per cube face that does not directly adjoin another cube (i.e.
  * every face except those sandwiched between two present cubes).
- * @param {Array<{x:number,y:number,z:number}>} cubes - integer cube centers
+ * @param {Array<{x:number,y:number,z:number}>} cubes - integer least corners
  * @returns {Array<{ cubeIndex: number, axis: number, sign: number, center: [number,number,number] }>}
+ *   `center` is the face's geometric center in world coordinates.
  */
 export function computeBoundaryCubeFaces(cubes) {
   const occupiedSet = new Set(cubes.map(({ x, y, z }) => `${x},${y},${z}`));
@@ -62,7 +62,9 @@ export function computeBoundaryCubeFaces(cubes) {
         const n = [x, y, z];
         n[axis] += sign;
         if (hasCube(n[0], n[1], n[2])) continue; // internal face between two present cubes
-        const center = [x, y, z];
+        // Cube center is least corner + 0.5 on each axis; the face is offset
+        // half a unit further along `axis` in the `sign` direction.
+        const center = [x + 0.5, y + 0.5, z + 0.5];
         center[axis] += sign / 2;
         boundaryFaces.push({ cubeIndex, axis, sign, center });
       }
@@ -73,7 +75,7 @@ export function computeBoundaryCubeFaces(cubes) {
 
 /**
  * Compute the brink skeleton of a cube assembly.
- * @param {Array<{x:number,y:number,z:number}>} cubes - integer cube centers
+ * @param {Array<{x:number,y:number,z:number}>} cubes - integer least corners
  * @returns {{
  *   vertices: Array<[number,number,number]>,
  *   edges: Array<[number,number]>,
@@ -84,15 +86,14 @@ export function computeBrinkSkeleton(cubes) {
   // --- Dimension 0: vertices = corner points touched by an odd number of cubes. ---
   const cornerCounts = new Map(); // pointKey -> count
   for (const { x, y, z } of cubes) {
-    const center = [2 * x, 2 * y, 2 * z];
     for (const offset of CORNER_OFFSETS) {
-      const p = [center[0] + offset[0], center[1] + offset[1], center[2] + offset[2]];
+      const p = [x + offset[0], y + offset[1], z + offset[2]];
       const k = pointKey(p);
       cornerCounts.set(k, (cornerCounts.get(k) || 0) + 1);
     }
   }
 
-  const vertexPoints = []; // doubled coords
+  const vertexPoints = []; // integer lattice coords
   for (const [k, count] of cornerCounts) {
     if (count % 2 === 1) {
       vertexPoints.push(k.split(',').map(Number));
@@ -187,8 +188,7 @@ export function computeBrinkSkeleton(cubes) {
     }
   }
 
-  const realVertices = vertexPoints.map((p) => [p[0] / 2, p[1] / 2, p[2] / 2]);
-  return { vertices: realVertices, edges, faces };
+  return { vertices: vertexPoints.map((p) => [p[0], p[1], p[2]]), edges, faces };
 }
 
 export function logBrinkSkeleton(skeleton) {

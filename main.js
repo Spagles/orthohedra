@@ -1,6 +1,7 @@
 import * as THREE from "https://esm.sh/three@0.172.0";
 import { TrackballControls } from "https://esm.sh/three@0.172.0/examples/jsm/controls/TrackballControls.js";
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
+import { realizeAbstractSkeleton, toAbstractSkeleton, fillCubesFromSkeleton } from "./realizeSkeleton.js";
 
 const SIZE = 49;
 const HALF = Math.floor(SIZE / 2);
@@ -19,6 +20,8 @@ const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
 const saveBtn = document.getElementById('saveBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
 const loadBtn = document.getElementById('loadBtn');
+const loadSkeletonBtn = document.getElementById('loadSkeletonBtn');
+const loadAbstractBtn = document.getElementById('loadAbstractBtn');
 
 async function main() {
   const scene = new THREE.Scene();
@@ -66,15 +69,20 @@ async function main() {
 
   scene.add(camera);
 
+  // Cubes are identified by their least (min-x,y,z) corner, so a cube at
+  // least corner c occupies [c, c+1]; with inBounds allowing MIN..MAX, the
+  // occupied world volume is [MIN, MAX+1].
   const bounds = new THREE.Box3(
-    new THREE.Vector3(MIN - 0.5, MIN - 0.5, MIN - 0.5),
-    new THREE.Vector3(MAX + 0.5, MAX + 0.5, MAX + 0.5)
+    new THREE.Vector3(MIN, MIN, MIN),
+    new THREE.Vector3(MAX + 1, MAX + 1, MAX + 1)
   );
   const boundsHelper = new THREE.Box3Helper(bounds, 0x3e4f8c);
   scene.add(boundsHelper);
 
   const grid = new THREE.GridHelper(SIZE + 1, SIZE + 1, 0x2f3d74, 0x22315f);
-  grid.position.y = MIN - 0.5;
+  // Sit the grid at the volume's lower Y face (y = MIN) and center it over
+  // the [MIN, MAX+1] volume, whose midpoint is 0.5 on X and Z.
+  grid.position.set(0.5, MIN, 0.5);
   scene.add(grid);
 
   // Boundary cube faces: one unit quad per non-internal cube face (every
@@ -273,19 +281,25 @@ async function main() {
   const STORAGE_KEY = 'cubes-editor:state';
   const RENDER_MODES = new Set(['normal', 'no-red', 'no-yellow', 'no-blue']);
 
-  function currentStateJSON() {
-    return JSON.stringify(
-      {
-        positions,
-        renderMode: currentRenderMode,
-        camera: {
-          position: camera.position.toArray(),
-          target: controls.target.toArray(),
-        },
+  // The autosave-to-localStorage path and the file-save paths share this
+  // serializer, but the brink skeleton is included ONLY in saved files
+  // (includeSkeleton = true) — never in the autosave, which stays lean and
+  // always re-derives the skeleton from `positions` on load. The saved
+  // skeleton is the concrete form { vertices, edges, faces }; the abstract
+  // form (no coordinates) is derivable from it when needed.
+  function currentStateJSON(includeSkeleton = false) {
+    const state = {
+      positions,
+      renderMode: currentRenderMode,
+      camera: {
+        position: camera.position.toArray(),
+        target: controls.target.toArray(),
       },
-      null,
-      2
-    );
+    };
+    if (includeSkeleton) {
+      state.skeleton = computeBrinkSkeleton(positions);
+    }
+    return JSON.stringify(state, null, 2);
   }
 
   function parseSavedState(raw) {
@@ -312,7 +326,36 @@ async function main() {
           ? parsed.camera
           : null;
 
-      return { positions, renderMode, camera: cameraState };
+      // The skeleton is present only in saved files (not autosave). Validate
+      // its shape loosely — it is only consumed by the skeleton/abstract
+      // load gestures, which tolerate its absence by falling back gracefully.
+      const skel = parsed.skeleton;
+      let skeleton =
+        skel &&
+        Array.isArray(skel.vertices) &&
+        skel.vertices.every(isVector3Array) &&
+        Array.isArray(skel.edges) &&
+        skel.edges.every((e) => Array.isArray(e) && e.length === 2 && e.every(Number.isInteger)) &&
+        Array.isArray(skel.faces) &&
+        skel.faces.every((f) => Array.isArray(f) && f.every(Number.isInteger))
+          ? { vertices: skel.vertices, edges: skel.edges, faces: skel.faces }
+          : null;
+
+      // Migrate skeletons saved under the OLD convention (cube centers at
+      // integers => skeleton vertices at half-integers). Reinterpreting the
+      // old integer `positions` in place as least-corners shifts the model
+      // +0.5 in world space, so the matching skeleton is the old vertices
+      // shifted +0.5, which also makes them the integers the new pipeline
+      // expects. Detect the old form by any non-integer vertex coordinate.
+      if (skeleton && skeleton.vertices.some((v) => v.some((c) => !Number.isInteger(c)))) {
+        skeleton = {
+          vertices: skeleton.vertices.map((v) => [v[0] + 0.5, v[1] + 0.5, v[2] + 0.5]),
+          edges: skeleton.edges,
+          faces: skeleton.faces,
+        };
+      }
+
+      return { positions, renderMode, camera: cameraState, skeleton };
     } catch {
       return null;
     }
@@ -337,7 +380,7 @@ async function main() {
 
   async function writeToFileHandle(handle) {
     const writable = await handle.createWritable();
-    await writable.write(currentStateJSON());
+    await writable.write(currentStateJSON(true));
     await writable.close();
   }
 
@@ -356,7 +399,7 @@ async function main() {
       return;
     }
 
-    const blob = new Blob([currentStateJSON()], { type: 'application/json' });
+    const blob = new Blob([currentStateJSON(true)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -397,9 +440,70 @@ async function main() {
     saveToLocalStorage();
   }
 
-  let fileInput = null;
+  // Three load gestures over ONE file format, differing only in how the
+  // cubes are derived:
+  //   'cubes'    — take the file's positions directly (skeleton re-derived).
+  //   'skeleton' — recover cubes from the file's concrete skeleton.
+  //   'abstract' — discard the skeleton's coordinates, re-realize them, then
+  //                recover cubes from the realized skeleton.
+  // In every case the applied `positions` are the sole source of truth: the
+  // app re-derives the brink skeleton from them on load (updateBrinkSkeleton
+  // via addVoxel), so any loaded/realized skeleton is used only transiently
+  // to compute the cubes and is then discarded. A round-trip where the
+  // re-derived skeleton matches the loaded one is the built-in correctness
+  // check.
+  function derivePositionsForInterpretation(state, interpretation) {
+    if (interpretation === 'cubes') return state.positions;
 
-  async function load() {
+    if (!state.skeleton) {
+      console.error(`Load failed: file has no skeleton to load as "${interpretation}".`);
+      return null;
+    }
+    try {
+      // 'skeleton' fills the file's concrete skeleton directly (exact
+      // round-trip). 'abstract' strips coordinates and re-realizes them
+      // before filling — the realizer emits integer coordinates in the same
+      // least-corner convention the fill expects, so no remapping is needed.
+      // NOTE: an abstract skeleton underdetermines geometry — realization
+      // picks a valid but not necessarily original embedding, so the abstract
+      // path is BEST-EFFORT: it recovers *some* solid with a skeleton
+      // isomorphic to the input, which may differ in shape (and pose) from
+      // the original.
+      let concrete;
+      if (interpretation === 'abstract') {
+        concrete = realizeAbstractSkeleton(toAbstractSkeleton(state.skeleton));
+        console.warn(
+          'Load Abstract is best-effort: coordinates are re-realized from the ' +
+            'coordinate-free graph, recovering some solid with an isomorphic ' +
+            'skeleton — not necessarily the original shape or pose.'
+        );
+      } else {
+        concrete = state.skeleton;
+      }
+      const cubes = fillCubesFromSkeleton(concrete);
+      const inBoundsCubes = cubes.filter((c) => inBounds(c.x, c.y, c.z));
+      if (inBoundsCubes.length !== cubes.length) {
+        console.warn(
+          `Load: ${cubes.length - inBoundsCubes.length} recovered cube(s) fell outside bounds and were dropped.`
+        );
+      }
+      return inBoundsCubes;
+    } catch (error) {
+      console.error(`Load failed while recovering cubes (${interpretation}):`, error);
+      return null;
+    }
+  }
+
+  function applyLoadedFile(state, interpretation) {
+    const positions = derivePositionsForInterpretation(state, interpretation);
+    if (!positions) return;
+    applyLoadedState({ ...state, positions });
+  }
+
+  let fileInput = null;
+  let pendingInterpretation = 'cubes';
+
+  async function load(interpretation = 'cubes') {
     if (hasFileSystemAccess) {
       try {
         const [handle] = await window.showOpenFilePicker({
@@ -411,14 +515,18 @@ async function main() {
           console.error('Load failed: file is not a valid cubes-editor save.');
           return;
         }
-        fileHandle = handle;
-        applyLoadedState(state);
+        // Only track the file handle for write-back on a plain cubes load; a
+        // skeleton/abstract load derives a fresh model that shouldn't quietly
+        // overwrite the source file on the next Save.
+        fileHandle = interpretation === 'cubes' ? handle : null;
+        applyLoadedFile(state, interpretation);
       } catch (error) {
         if (error?.name !== 'AbortError') console.error('Load failed:', error);
       }
       return;
     }
 
+    pendingInterpretation = interpretation;
     if (!fileInput) {
       fileInput = document.createElement('input');
       fileInput.type = 'file';
@@ -434,7 +542,7 @@ async function main() {
           console.error('Load failed: file is not a valid cubes-editor save.');
           return;
         }
-        applyLoadedState(state);
+        applyLoadedFile(state, pendingInterpretation);
       });
     }
     fileInput.click();
@@ -615,7 +723,9 @@ async function main() {
 
   saveBtn.addEventListener('click', () => save());
   saveAsBtn.addEventListener('click', () => saveAs());
-  loadBtn.addEventListener('click', () => load());
+  loadBtn.addEventListener('click', () => load('cubes'));
+  loadSkeletonBtn.addEventListener('click', () => load('skeleton'));
+  loadAbstractBtn.addEventListener('click', () => load('abstract'));
 
   renderModeInputs.forEach((input) => {
     input.addEventListener('change', () => {
