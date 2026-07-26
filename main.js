@@ -11,6 +11,7 @@ const MAX_INSTANCES = SIZE * SIZE * SIZE;
 const app = document.getElementById('app');
 const errorEl = document.getElementById('error');
 const statusEl = document.getElementById('status');
+const skeletonStatsEl = document.getElementById('skeletonStats');
 const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
 const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
@@ -458,6 +459,10 @@ async function main() {
     const skeleton = computeBrinkSkeleton(positions);
     logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
+    const V = skeleton.vertices.length;
+    const E = skeleton.edges.length;
+    const F = skeleton.faces.length;
+    skeletonStatsEl.innerHTML = `Skeleton: V ${V}, E ${E}, F ${F}<br>Euler χ: ${V - E + F}`;
     renderBoundaryCubeFaces(positions);
     saveToLocalStorage();
   }
