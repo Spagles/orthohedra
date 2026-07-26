@@ -14,6 +14,7 @@ const statusEl = document.getElementById('status');
 const skeletonStatsEl = document.getElementById('skeletonStats');
 const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
+const resetBtn = document.getElementById('resetBtn');
 const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
 const saveBtn = document.getElementById('saveBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
@@ -467,6 +468,12 @@ async function main() {
     saveToLocalStorage();
   }
 
+  function reset() {
+    for (const { x, y, z } of [...positions]) removeVoxel(x, y, z);
+    addVoxel(0, 0, 0);
+    updateStatus(mode);
+  }
+
   function addVoxel(x, y, z) {
     if (!inBounds(x, y, z) || hasVoxel(x, y, z)) return false;
 
@@ -572,6 +579,7 @@ async function main() {
 
   buildBtn.addEventListener('click', () => setMode('build'));
   destroyBtn.addEventListener('click', () => setMode('destroy'));
+  resetBtn.addEventListener('click', () => reset());
 
   saveBtn.addEventListener('click', () => save());
   saveAsBtn.addEventListener('click', () => saveAs());
