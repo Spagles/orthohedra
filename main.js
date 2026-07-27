@@ -708,12 +708,43 @@ async function main() {
     return true;
   }
 
+  // Load a design from a URL given as the `design` query parameter — both
+  // absolute (?design=https://host/path/cubes.json) and relative
+  // (?design=designs/cubes.json) URLs are supported. Takes precedence over
+  // the autosaved localStorage state. Loaded via the same parse path as
+  // file loads and applied as a plain 'cubes' load (skeleton re-derived).
+  async function loadFromDesignParam() {
+    const raw = new URLSearchParams(window.location.search).get('design');
+    if (!raw) return null;
+    // Resolve against the page URL so a relative value fetches from the
+    // right base regardless of the current path; new URL(raw, base) accepts
+    // absolute URLs unchanged and turns relative ones into absolute.
+    const url = new URL(raw, window.location.href).href;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      }
+      const state = parseSavedState(await response.text());
+      if (!state) {
+        throw new Error('not a valid cubes-editor save');
+      }
+      return state;
+    } catch (error) {
+      console.error(`Load from ?design=${url} failed:`, error);
+      errorEl.style.display = 'grid';
+      errorEl.textContent = `Load from design URL failed: ${error?.message || error}`;
+      return null;
+    }
+  }
+
   // Restore previously saved state, if any: render mode and camera first
   // (so the position-restoring addVoxel calls below, which each trigger a
   // save, re-persist the already-correct values instead of clobbering
-  // them with defaults), then the assembly itself. With nothing saved,
-  // fall back to a single cube centered in the 49x49x49 build volume.
-  const saved = loadFromLocalStorage();
+  // them with defaults), then the assembly itself. A `design` URL param, if
+  // present and valid, overrides the autosaved localStorage state. With
+  // nothing saved, fall back to a single cube centered in the build volume.
+  const saved = (await loadFromDesignParam()) ?? loadFromLocalStorage();
 
   if (saved?.camera) {
     camera.position.fromArray(saved.camera.position);
