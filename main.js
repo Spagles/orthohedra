@@ -1,7 +1,7 @@
 import * as THREE from "https://esm.sh/three@0.172.0";
 import { TrackballControls } from "https://esm.sh/three@0.172.0/examples/jsm/controls/TrackballControls.js";
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
-import { realizeAbstractSkeleton, toAbstractSkeleton, fillCubesFromSkeleton } from "./realizeSkeleton.js";
+import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 
 const SIZE = 49;
 const HALF = Math.floor(SIZE / 2);
@@ -22,6 +22,8 @@ const saveAsBtn = document.getElementById('saveAsBtn');
 const loadBtn = document.getElementById('loadBtn');
 const loadSkeletonBtn = document.getElementById('loadSkeletonBtn');
 const loadAbstractBtn = document.getElementById('loadAbstractBtn');
+const busyOverlay = document.getElementById('busyOverlay');
+const cancelBusyBtn = document.getElementById('cancelBusyBtn');
 
 async function main() {
   const scene = new THREE.Scene();
@@ -452,50 +454,111 @@ async function main() {
   // to compute the cubes and is then discarded. A round-trip where the
   // re-derived skeleton matches the loaded one is the built-in correctness
   // check.
-  function derivePositionsForInterpretation(state, interpretation) {
-    if (interpretation === 'cubes') return state.positions;
+  const dropOutOfBounds = (cubes) => {
+    const kept = cubes.filter((c) => inBounds(c.x, c.y, c.z));
+    if (kept.length !== cubes.length) {
+      console.warn(`Load: ${cubes.length - kept.length} recovered cube(s) fell outside bounds and were dropped.`);
+    }
+    return kept;
+  };
 
+  // Synchronous cube derivation for the 'cubes' and 'skeleton' gestures (both
+  // fast). The 'abstract' gesture is handled separately via a worker because
+  // its coordinate realization can be slow — see realizeAbstract().
+  function derivePositionsSync(state, interpretation) {
+    if (interpretation === 'cubes') return state.positions;
     if (!state.skeleton) {
       console.error(`Load failed: file has no skeleton to load as "${interpretation}".`);
       return null;
     }
     try {
       // 'skeleton' fills the file's concrete skeleton directly (exact
-      // round-trip). 'abstract' strips coordinates and re-realizes them
-      // before filling — the realizer emits integer coordinates in the same
-      // least-corner convention the fill expects, so no remapping is needed.
-      // NOTE: an abstract skeleton underdetermines geometry — realization
-      // picks a valid but not necessarily original embedding, so the abstract
-      // path is BEST-EFFORT: it recovers *some* solid with a skeleton
-      // isomorphic to the input, which may differ in shape (and pose) from
-      // the original.
-      let concrete;
-      if (interpretation === 'abstract') {
-        concrete = realizeAbstractSkeleton(toAbstractSkeleton(state.skeleton));
-        console.warn(
-          'Load Abstract is best-effort: coordinates are re-realized from the ' +
-            'coordinate-free graph, recovering some solid with an isomorphic ' +
-            'skeleton — not necessarily the original shape or pose.'
-        );
-      } else {
-        concrete = state.skeleton;
-      }
-      const cubes = fillCubesFromSkeleton(concrete);
-      const inBoundsCubes = cubes.filter((c) => inBounds(c.x, c.y, c.z));
-      if (inBoundsCubes.length !== cubes.length) {
-        console.warn(
-          `Load: ${cubes.length - inBoundsCubes.length} recovered cube(s) fell outside bounds and were dropped.`
-        );
-      }
-      return inBoundsCubes;
+      // round-trip).
+      const cubes = fillCubesFromSkeleton(state.skeleton);
+      return dropOutOfBounds(cubes);
     } catch (error) {
       console.error(`Load failed while recovering cubes (${interpretation}):`, error);
       return null;
     }
   }
 
-  function applyLoadedFile(state, interpretation) {
-    const positions = derivePositionsForInterpretation(state, interpretation);
+  // --- Abstract realization worker ---------------------------------------
+  // The abstract gesture strips the skeleton's coordinates and re-realizes
+  // them, then fills cubes. Realization backtracks to find a valid slab
+  // ordering and can take seconds on large models, so it runs in a worker to
+  // keep the UI responsive; the worker can be terminated to cancel. NOTE:
+  // BEST-EFFORT — an abstract skeleton underdetermines geometry, so the
+  // recovered solid has a skeleton isomorphic to the input but may differ in
+  // shape/pose from the original.
+  let busy = false;
+  function setBusy(on) {
+    busy = on;
+    busyOverlay.hidden = !on;
+  }
+
+  let realizeWorker = null;
+  let realizeReject = null; // reject fn of the in-flight realization, if any
+
+  function realizeAbstract(skeleton) {
+    return new Promise((resolve, reject) => {
+      realizeWorker = new Worker(new URL('./realizeWorker.js', import.meta.url), { type: 'module' });
+      realizeReject = reject;
+      realizeWorker.onmessage = (event) => {
+        const { cubes, error } = event.data;
+        teardownWorker();
+        if (error) reject(new Error(error));
+        else resolve(cubes);
+      };
+      realizeWorker.onerror = (event) => {
+        teardownWorker();
+        reject(new Error(event.message || 'Realization worker failed'));
+      };
+      realizeWorker.postMessage({ skeleton });
+    });
+  }
+
+  function teardownWorker() {
+    if (realizeWorker) {
+      realizeWorker.terminate();
+      realizeWorker = null;
+    }
+    realizeReject = null;
+  }
+
+  function cancelRealization() {
+    if (realizeReject) {
+      const reject = realizeReject;
+      teardownWorker();
+      reject(new Error('cancelled'));
+    }
+  }
+
+  async function applyLoadedFile(state, interpretation) {
+    if (interpretation === 'abstract') {
+      if (!state.skeleton) {
+        console.error('Load failed: file has no skeleton to load as "abstract".');
+        return;
+      }
+      console.warn(
+        'Load Abstract is best-effort: coordinates are re-realized from the ' +
+          'coordinate-free graph, recovering some solid with an isomorphic ' +
+          'skeleton — not necessarily the original shape or pose.'
+      );
+      setBusy(true);
+      try {
+        const cubes = await realizeAbstract(state.skeleton);
+        applyLoadedState({ ...state, positions: dropOutOfBounds(cubes) });
+      } catch (error) {
+        if (error?.message !== 'cancelled') {
+          console.error('Load failed while realizing abstract skeleton:', error);
+        }
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
+    const positions = derivePositionsSync(state, interpretation);
     if (!positions) return;
     applyLoadedState({ ...state, positions });
   }
@@ -519,7 +582,7 @@ async function main() {
         // skeleton/abstract load derives a fresh model that shouldn't quietly
         // overwrite the source file on the next Save.
         fileHandle = interpretation === 'cubes' ? handle : null;
-        applyLoadedFile(state, interpretation);
+        await applyLoadedFile(state, interpretation);
       } catch (error) {
         if (error?.name !== 'AbortError') console.error('Load failed:', error);
       }
@@ -542,7 +605,7 @@ async function main() {
           console.error('Load failed: file is not a valid cubes-editor save.');
           return;
         }
-        applyLoadedFile(state, pendingInterpretation);
+        await applyLoadedFile(state, pendingInterpretation);
       });
     }
     fileInput.click();
@@ -693,6 +756,7 @@ async function main() {
   }
 
   function handleEdit(clientX, clientY) {
+    if (busy) return; // edits are suspended while a realization runs
     const hits = getIntersection(clientX, clientY);
     if (!hits.length) return;
 
@@ -726,6 +790,7 @@ async function main() {
   loadBtn.addEventListener('click', () => load('cubes'));
   loadSkeletonBtn.addEventListener('click', () => load('skeleton'));
   loadAbstractBtn.addEventListener('click', () => load('abstract'));
+  cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
   renderModeInputs.forEach((input) => {
     input.addEventListener('change', () => {

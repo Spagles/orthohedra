@@ -33,14 +33,18 @@
 //   Pass 2 — coordinate value per axis. For a fixed axis a, two vertices
 //     share their a-coordinate iff joined by a path of non-a edges (moving
 //     along a non-a edge never changes coordinate a). Union-find those into
-//     "a-slabs". Edges that DO run along a connect distinct slabs, but they
-//     do NOT fix the gap between them (on a grid line, paired extremal
-//     vertices may sit any distance apart). So the only hard constraint is
-//     that along-a-adjacent slabs get distinct values; give every slab a
-//     distinct integer via a running counter (BFS over the slab adjacency,
-//     continued across components), which is compact and keeps every
-//     along-a edge non-degenerate. The remaining mirror/stretch freedom of
-//     the abstract graph is resolved compactly here.
+//     "a-slabs", one per distinct a-coordinate, then ORDER the slabs. The
+//     order matters: on every line (fixed on the other two axes) the along-a
+//     edges pair extremal vertices that are CONSECUTIVE in a-coordinate, so
+//     the paired slabs must be adjacent among that line's occupied slabs.
+//     (Assigning slab values in the wrong order produces "interleaved" edges
+//     — an edge spanning a-values 0..2 with another slab at 1 between them —
+//     which is not a valid brink skeleton and makes a later re-derivation
+//     disagree on faces.) A valid order always exists; we find one by
+//     backtracking placement, pruning any prefix that forces a pair apart.
+//     Only per-line pairing is used, so this is robust to self-intersecting
+//     ("pinched") faces. The backtracking can be slow on large models, so
+//     realization is meant to run in a worker off the UI thread.
 //
 // A final validity check confirms all vertices are distinct and every edge
 // is axis-aligned — catching abstract graphs that pass local checks but
@@ -177,39 +181,45 @@ export function realizeAbstractSkeleton(abstract) {
   // ===================================================================
   const coords = Array.from({ length: vertexCount }, () => [null, null, null]);
 
-  for (const axis of AXES) {
-    // Union vertices connected by edges NOT along `axis` — each class is
-    // one "slab" sharing this axis-coordinate.
+  // Slab membership per axis: two vertices share their `axis` coordinate iff
+  // joined by a path of non-`axis` edges. Computed for all axes first, so a
+  // vertex's "line" along one axis is named by its slabs on the OTHER two
+  // axes (two vertices are colinear along `axis` iff they share a slab on
+  // both other axes).
+  const slabUF = AXES.map((axis) => {
     const uf = makeUF(vertexCount);
     for (let ei = 0; ei < E; ei++) {
       if (edgeAxis[ei] === axis) continue;
       const [u, v] = edges[ei];
       uf.union(u, v);
     }
+    return uf;
+  });
 
-    // An edge ALONG `axis` joins two distinct slabs that must therefore get
-    // DIFFERENT integer values. It does NOT fix the gap between them: on a
-    // grid line the extremal vertices are paired consecutively but may sit
-    // any distance apart (e.g. an L-shape has an edge from x=-0.5 straight
-    // to x=1.5, skipping the x=0.5 that exists only on other lines). So the
-    // only hard constraint along `axis` is: slabs joined by an along-axis
-    // edge are distinct. We choose a compact assignment: give each slab a
-    // distinct integer, consistent with an ordering derived from those
-    // edges. Orient each connected component of the slab graph via BFS
-    // (assigning increasing depth), which yields distinct values and keeps
-    // every along-axis edge non-degenerate; the mirror/stretch freedom left
-    // by the abstract graph is resolved compactly here.
-    const slabAdj = new Map(); // slabRep -> Set(slabRep)
-    function ensure(s) {
-      if (!slabAdj.has(s)) slabAdj.set(s, new Set());
-      return slabAdj.get(s);
-    }
+  for (const axis of AXES) {
+    const uf = slabUF[axis];
+    const [oa, ob] = AXES.filter((a) => a !== axis);
+
     const allSlabs = new Set();
-    for (let vtx = 0; vtx < vertexCount; vtx++) {
-      const s = uf.find(vtx);
-      allSlabs.add(s);
-      ensure(s);
-    }
+    for (let vtx = 0; vtx < vertexCount; vtx++) allSlabs.add(uf.find(vtx));
+    const slabs = [...allSlabs];
+
+    // Group by line (fixed on the other two axes): each line records its
+    // occupied slabs and the along-`axis` edge pairs on it. In a valid brink
+    // skeleton the extremal vertices on a line pair consecutively, so on each
+    // line the paired slabs must be adjacent among that line's occupied
+    // slabs. Getting this wrong yields "interleaved" edges (an edge spanning
+    // slab-values 0..2 with another occupied slab at 1 between them), which is
+    // not a valid skeleton and makes a later re-derivation disagree on faces.
+    // Only per-line pairing is used, so this is robust to self-intersecting
+    // ("pinched") faces.
+    const lineKey = (vtx) => `${slabUF[oa].find(vtx)},${slabUF[ob].find(vtx)}`;
+    const lines = new Map(); // key -> { occ:Set(slab), pairs:[[slab,slab],...] }
+    const ensureLine = (k) => {
+      if (!lines.has(k)) lines.set(k, { occ: new Set(), pairs: [] });
+      return lines.get(k);
+    };
+    for (let vtx = 0; vtx < vertexCount; vtx++) ensureLine(lineKey(vtx)).occ.add(uf.find(vtx));
     for (let ei = 0; ei < E; ei++) {
       if (edgeAxis[ei] !== axis) continue;
       const [u, v] = edges[ei];
@@ -218,31 +228,49 @@ export function realizeAbstractSkeleton(abstract) {
       if (su === sv) {
         throw new Error(`Edge ${ei} runs along axis ${axis} but its endpoints share a slab.`);
       }
-      ensure(su).add(sv);
-      ensure(sv).add(su);
+      ensureLine(lineKey(u)).pairs.push([su, sv]); // u, v share a line
     }
+    const linesArr = [...lines.values()].map((L) => ({ occ: [...L.occ], pairs: L.pairs }));
+    const linesOfSlab = new Map();
+    for (const s of slabs) linesOfSlab.set(s, []);
+    for (const L of linesArr) for (const s of L.occ) linesOfSlab.get(s).push(L);
 
-    // Assign each slab a distinct integer. Within a connected component of
-    // the slab graph, number slabs by BFS-discovery order starting at
-    // `nextAvailable`; separate components continue the counter so no two
-    // slabs (hence no two vertices differing only in `axis`) collide.
-    const slabValue = new Map();
-    let nextAvailable = 0;
-    for (const startSlab of allSlabs) {
-      if (slabValue.has(startSlab)) continue;
-      const queue = [startSlab];
-      slabValue.set(startSlab, nextAvailable++);
-      while (queue.length > 0) {
-        const s = queue.shift();
-        for (const nb of ensure(s)) {
-          if (slabValue.has(nb)) continue;
-          slabValue.set(nb, nextAvailable++);
-          queue.push(nb);
+    // Find an ordering of the slabs with no interleaving by backtracking
+    // placement, pruning any prefix that already forces a pair apart. On a
+    // genuine skeleton a valid order always exists; the search can spike to
+    // seconds on larger models, which is why callers run realization in a
+    // worker (see realizeWorker.js) rather than on the UI thread.
+    const pos = new Map();
+    const order = [];
+    const brokenAt = (s) => {
+      for (const L of linesOfSlab.get(s)) {
+        if (L.pairs.length === 0) continue;
+        const placed = L.occ.filter((x) => pos.has(x)).sort((a, b) => pos.get(a) - pos.get(b));
+        for (const [a, b] of L.pairs) {
+          if (!pos.has(a) || !pos.has(b)) continue;
+          if (Math.abs(placed.indexOf(a) - placed.indexOf(b)) !== 1) return true;
         }
       }
+      return false;
+    };
+    const place = (depth) => {
+      if (depth === slabs.length) return true;
+      for (const s of slabs) {
+        if (pos.has(s)) continue;
+        pos.set(s, depth);
+        order.push(s);
+        if (!brokenAt(s) && place(depth + 1)) return true;
+        pos.delete(s);
+        order.pop();
+      }
+      return false;
+    };
+    if (!place(0)) {
+      throw new Error(`No straddle-free ordering exists along axis ${axis}.`);
     }
 
-    // Write this axis's coordinate onto every vertex from its slab.
+    const slabValue = new Map();
+    order.forEach((s, i) => slabValue.set(s, i));
     for (let vtx = 0; vtx < vertexCount; vtx++) {
       coords[vtx][axis] = slabValue.get(uf.find(vtx));
     }
