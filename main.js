@@ -3,7 +3,7 @@ import { TrackballControls } from "https://esm.sh/three@0.172.0/examples/jsm/con
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 
-const SIZE = 49;
+const SIZE = 79;
 const HALF = Math.floor(SIZE / 2);
 const MIN = -HALF;
 const MAX = HALF;
