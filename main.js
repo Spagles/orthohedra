@@ -240,8 +240,8 @@ async function main() {
   // give this the plane color as emissive too, matching their appearance
   // regardless of scene lighting. Its own instanced mesh so an arbitrary
   // number of quads can be shown.
-  const TEMP_FACE_EMISSIVE_DIM = 0.35; // free-floating, not on a plane
-  const TEMP_FACE_EMISSIVE_BRIGHT = 1.0; // snapped onto an available plane
+  const TEMP_FACE_EMISSIVE_DIM = 0.3; // free-floating, not on a plane
+  const TEMP_FACE_EMISSIVE_BRIGHT = 2.2; // snapped onto an available plane
   const tempFaceMaterial = new THREE.MeshStandardMaterial({
     color: AVAIL_PLANE_COLOR,
     emissive: AVAIL_PLANE_COLOR,
@@ -1188,13 +1188,12 @@ async function main() {
     const value = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
     drag.dragValue = value;
     const { plane, dist } = nearestPlane(value, drag.planes);
-    // Snap the rendered temp face to a nearby available plane, but keep the raw
-    // value so dragging past it can reach the next plane.
-    drag.snapValue = dist <= 0.5 ? plane : value;
-    // Brighten the face once it's within the commit threshold of a plane — the
-    // range where releasing would actually snap-and-commit there.
-    tempFaceMaterial.emissiveIntensity =
-      dist <= SNAP_THRESHOLD ? TEMP_FACE_EMISSIVE_BRIGHT : TEMP_FACE_EMISSIVE_DIM;
+    // Within the snap threshold the temp face snaps to the plane (and brightens
+    // to signal a release would commit there); otherwise it follows the raw
+    // value, so dragging past a plane can reach the next one.
+    const snapped = dist <= SNAP_THRESHOLD;
+    drag.snapValue = snapped ? plane : value;
+    tempFaceMaterial.emissiveIntensity = snapped ? TEMP_FACE_EMISSIVE_BRIGHT : TEMP_FACE_EMISSIVE_DIM;
     renderTempFace(drag.snapValue);
   }
 
