@@ -16,6 +16,11 @@ const skeletonStatsEl = document.getElementById('skeletonStats');
 const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
 const resetBtn = document.getElementById('resetBtn');
+const moveBtns = [
+  document.getElementById('moveRedBtn'),
+  document.getElementById('moveYellowBtn'),
+  document.getElementById('moveBlueBtn'),
+];
 const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
 const saveBtn = document.getElementById('saveBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
@@ -174,6 +179,84 @@ async function main() {
   hoverOutline.visible = false;
   scene.add(hoverOutline);
 
+  // --- Move mode visuals ---------------------------------------------------
+  // "Available planes": large gridded squares drawn at edit-axis values that
+  // hold no boundary face orthogonal to the edit axis — the valid destinations
+  // a dragged face can snap to. One reusable pool of plane helpers, oriented
+  // to face along the current edit axis and positioned per available value.
+  const AVAIL_PLANE_SIZE = 7; // 7x7 unit squares
+  const AVAIL_PLANE_COLOR = 0x9b5cff; // purple
+  const availablePlanesGroup = new THREE.Group();
+  availablePlanesGroup.visible = false;
+  scene.add(availablePlanesGroup);
+  const availablePlanePool = [];
+
+  function getAvailablePlaneHelper(i) {
+    if (availablePlanePool[i]) return availablePlanePool[i];
+    // A purple grid of lines (7x7 unit cells) in the XY plane (normal +Z),
+    // rotated per edit axis when positioned. Grid lines only — no fill quad.
+    const grid = new THREE.GridHelper(AVAIL_PLANE_SIZE, AVAIL_PLANE_SIZE, AVAIL_PLANE_COLOR, AVAIL_PLANE_COLOR);
+    // GridHelper lies in the XZ plane (normal +Y); tip it up to the XY plane
+    // (normal +Z) so the group's per-axis quaternion below aims the normal.
+    grid.rotation.x = Math.PI / 2;
+    const group = new THREE.Group();
+    group.add(grid);
+    availablePlanesGroup.add(group);
+    availablePlanePool[i] = group;
+    return group;
+  }
+
+  // Orient an available plane (default normal +Z) to face along `axis`, and
+  // center it on `axis`=value over the assembly center on the other two axes.
+  const availPlaneQuaternions = [
+    new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2), // +Z -> +X
+    new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2), // +Z -> +Y
+    new THREE.Quaternion(), // +Z -> +Z
+  ];
+
+  function showAvailablePlanes(axis, values, centerOther) {
+    availablePlanesGroup.visible = true;
+    for (let i = 0; i < values.length; i++) {
+      const group = getAvailablePlaneHelper(i);
+      group.visible = true;
+      group.quaternion.copy(availPlaneQuaternions[axis]);
+      const p = [centerOther[0], centerOther[1], centerOther[2]];
+      p[axis] = values[i];
+      group.position.set(p[0], p[1], p[2]);
+    }
+    for (let i = values.length; i < availablePlanePool.length; i++) {
+      if (availablePlanePool[i]) availablePlanePool[i].visible = false;
+    }
+  }
+
+  function hideAvailablePlanes() {
+    availablePlanesGroup.visible = false;
+    for (const g of availablePlanePool) if (g) g.visible = false;
+  }
+
+  // Temp face: a solid copy of the dragged face's unit quads that moves
+  // continuously with the drag (snapping to available planes), colored the
+  // same purple as the available-plane grids. The grids are unlit lines, so we
+  // give this the plane color as emissive too, matching their appearance
+  // regardless of scene lighting. Its own instanced mesh so an arbitrary
+  // number of quads can be shown.
+  const TEMP_FACE_EMISSIVE_DIM = 0.35; // free-floating, not on a plane
+  const TEMP_FACE_EMISSIVE_BRIGHT = 1.0; // snapped onto an available plane
+  const tempFaceMaterial = new THREE.MeshStandardMaterial({
+    color: AVAIL_PLANE_COLOR,
+    emissive: AVAIL_PLANE_COLOR,
+    emissiveIntensity: TEMP_FACE_EMISSIVE_DIM,
+    roughness: 0.5,
+    metalness: 0.05,
+    side: THREE.DoubleSide,
+  });
+  const tempFaceMesh = new THREE.InstancedMesh(faceGeometry, tempFaceMaterial, FACE_MAX_INSTANCES);
+  tempFaceMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  tempFaceMesh.frustumCulled = false;
+  tempFaceMesh.renderOrder = 2;
+  tempFaceMesh.count = 0;
+  scene.add(tempFaceMesh);
+
   // Brink skeleton rendering: white spheres at vertices, and
   // cylinders for edges colored red/yellow/blue by their X/Y/Z axis.
   const SKELETON_VERTEX_RADIUS = (0.125 / 2) * 1.6; // diameter 1/8 of a cube edge, scaled 60% larger
@@ -211,6 +294,10 @@ async function main() {
     currentRenderMode = mode;
     const hiddenAxis = AXIS_INDEX_BY_HIDDEN_COLOR[mode];
     for (let axis = 0; axis < 3; axis++) {
+      // All three face meshes are shown in every render mode (Move mode hides
+      // two of them via .visible; restore that here). Transparency is what
+      // "no-X" modes use, controlled by opacity/depthWrite below.
+      cubeFaceMeshes[axis].visible = true;
       skeletonEdgeMeshes[axis].visible = axis !== hiddenAxis;
       // A face's plane contains the hidden axis unless the face's own
       // normal IS that axis — e.g. hiding red (X) leaves X-normal faces
@@ -275,6 +362,124 @@ async function main() {
       }
       mesh.instanceMatrix.needsUpdate = true;
     }
+  }
+
+  // --- Move mode: drag a connected boundary face along its orthogonal axis --
+  // `moveAxis` is null outside move mode, else 0/1/2 (X=red, Y=yellow, Z=blue).
+  // In move mode we display the full skeleton but only the boundary faces whose
+  // NORMAL is the edit axis (those never contain an edit-axis edge, so they can
+  // be grabbed and dragged freely along that axis).
+  let moveAxis = null;
+
+  function setMoveRender(axis) {
+    for (let a = 0; a < 3; a++) {
+      // All edges visible (full skeleton).
+      skeletonEdgeMeshes[a].visible = true;
+      // Only the edit-axis-normal face mesh is shown, fully opaque.
+      const shown = a === axis;
+      cubeFaceMeshes[a].visible = shown;
+      cubeFaceMaterials[a].opacity = 1;
+      cubeFaceMaterials[a].depthWrite = true;
+      cubeFaceMeshes[a].renderOrder = 0;
+    }
+  }
+
+  // The 4 integer-lattice corners of a boundary face (a unit quad). `axis` is
+  // the face normal; `center` is its half-integer world center. The corners
+  // share the integer edit-axis coordinate center[axis] and vary by ±0.5 on
+  // the other two axes — those become integer corners of the quad.
+  function faceCorners(axis, center) {
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
+    const corners = [];
+    for (const du of [-0.5, 0.5]) {
+      for (const dv of [-0.5, 0.5]) {
+        const c = [center[0], center[1], center[2]];
+        c[ua] += du;
+        c[ub] += dv;
+        corners.push(c);
+      }
+    }
+    return corners;
+  }
+
+  const cornerKey = (c) => `${c[0]},${c[1]},${c[2]}`;
+
+  // Flood-fill the rendered boundary faces (on the edit-axis-normal mesh) that
+  // make up ONE brink-skeleton face containing the grabbed quad `startId`,
+  // returning those quads' instance ids and their shared integer edit-axis
+  // coordinate. Uses the faces already computed for rendering
+  // (boundaryFaceInfoByAxis) — no re-derivation.
+  //
+  // Connectivity is by SHARED CORNER (which subsumes shared edge). A single
+  // brink-skeleton face may self-cross (a "pinched" hexagon that reads as two
+  // squares meeting at a point); its two lobes touch only at that crossing
+  // corner, so edge-adjacency alone would split them. By brink-skeleton rules
+  // a crossing point is non-extremal (even parity, not a skeleton vertex), so
+  // two genuinely distinct faces never share a corner — corner-adjacency
+  // merges a pinched face's lobes without ever merging separate faces.
+  function connectedFace(axis, startId) {
+    const faces = boundaryFaceInfoByAxis[axis];
+    const coord = Math.round(faces[startId].center[axis]);
+
+    // Map each corner point (at this edit-axis coordinate) to the quads that
+    // touch it, so a flood-fill can hop between corner-adjacent quads.
+    const cornersOf = new Map();
+    const quadsAtCorner = new Map();
+    for (let id = 0; id < faces.length; id++) {
+      if (Math.round(faces[id].center[axis]) !== coord) continue;
+      const corners = faceCorners(axis, faces[id].center);
+      cornersOf.set(id, corners);
+      for (const c of corners) {
+        const ck = cornerKey(c);
+        if (!quadsAtCorner.has(ck)) quadsAtCorner.set(ck, []);
+        quadsAtCorner.get(ck).push(id);
+      }
+    }
+
+    const visited = new Set([startId]);
+    const stack = [startId];
+    while (stack.length) {
+      const id = stack.pop();
+      for (const c of cornersOf.get(id)) {
+        for (const nb of quadsAtCorner.get(cornerKey(c))) {
+          if (!visited.has(nb)) {
+            visited.add(nb);
+            stack.push(nb);
+          }
+        }
+      }
+    }
+
+    return { quadIds: [...visited], coord };
+  }
+
+  // Edit-axis integer values that hold NO boundary face orthogonal to the edit
+  // axis (the drag's valid snap destinations). Always includes three planes
+  // just beyond each extreme of the assembly on that axis, plus any interior
+  // gaps. Excludes `excludeCoord` (the face's own current plane) so it isn't
+  // offered as a destination.
+  function computeAvailablePlanes(axis, excludeCoord) {
+    const faces = boundaryFaceInfoByAxis[axis];
+    const occupiedVals = new Set();
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const f of faces) {
+      const v = Math.round(f.center[axis]);
+      occupiedVals.add(v);
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    if (!Number.isFinite(lo)) {
+      lo = 0;
+      hi = 0;
+    }
+
+    const values = [];
+    for (let v = lo - 3; v <= hi + 3; v++) {
+      if (v === excludeCoord) continue;
+      if (!occupiedVals.has(v)) values.push(v);
+    }
+    return values;
   }
 
   const occupied = new Map();
@@ -624,7 +829,9 @@ async function main() {
   }
 
   function updateStatus(mode) {
-    statusEl.innerHTML = `Mode: ${mode === 'build' ? 'Build' : 'Destroy'}<br>Cubes: ${positions.length}`;
+    const MOVE_LABELS = ['Move Red', 'Move Yellow', 'Move Blue'];
+    const label = moveAxis !== null ? MOVE_LABELS[moveAxis] : mode === 'build' ? 'Build' : 'Destroy';
+    statusEl.innerHTML = `Mode: ${label}<br>Cubes: ${positions.length}`;
   }
 
   // A graph is bipartite iff it has no odd-length cycle. 2-color each
@@ -708,6 +915,32 @@ async function main() {
     return true;
   }
 
+  // Presence toggles that DON'T recompute the skeleton — for batched edits
+  // (e.g. a face-move sweeping many cells) where the caller recomputes once at
+  // the end via updateBrinkSkeleton(). Same swap-pop bookkeeping as
+  // add/removeVoxel, just without the per-cell recompute.
+  function addVoxelRaw(x, y, z) {
+    if (!inBounds(x, y, z) || hasVoxel(x, y, z)) return false;
+    occupied.set(key(x, y, z), positions.length);
+    positions.push({ x, y, z });
+    return true;
+  }
+
+  function removeVoxelRaw(x, y, z) {
+    const removeKey = key(x, y, z);
+    const removeIdx = occupied.get(removeKey);
+    if (removeIdx === undefined) return false;
+    const lastIdx = positions.length - 1;
+    const lastPos = positions[lastIdx];
+    if (removeIdx !== lastIdx) {
+      positions[removeIdx] = lastPos;
+      occupied.set(key(lastPos.x, lastPos.y, lastPos.z), removeIdx);
+    }
+    positions.pop();
+    occupied.delete(removeKey);
+    return true;
+  }
+
   // Load a design from a URL given as the `design` query parameter — both
   // absolute (?design=https://host/path/cubes.json) and relative
   // (?design=designs/cubes.json) URLs are supported. Takes precedence over
@@ -773,21 +1006,50 @@ async function main() {
 
   function setMode(nextMode) {
     mode = nextMode;
+    setMoveAxis(null); // Build/Destroy and Move are mutually exclusive
     buildBtn.classList.toggle('active', mode === 'build');
     destroyBtn.classList.toggle('active', mode === 'destroy');
     updateStatus(mode);
   }
 
-  function getIntersection(clientX, clientY) {
+  function setMoveAxis(axis) {
+    if (moveAxis === axis) return;
+    cancelDrag();
+    moveAxis = axis;
+    for (let a = 0; a < 3; a++) moveBtns[a].classList.toggle('active', a === axis);
+    // The render-mode radios don't apply during move mode (which drives its own
+    // special rendering), so disable them while a move axis is active and
+    // re-enable them on exit.
+    renderModeInputs.forEach((input) => (input.disabled = axis !== null));
+    if (axis === null) {
+      hideAvailablePlanes();
+      setRenderMode(currentRenderMode); // restore the standard render mode
+    } else {
+      // Leaving Build/Destroy: drop their active styling and status.
+      buildBtn.classList.remove('active');
+      destroyBtn.classList.remove('active');
+      hoverOutline.visible = false;
+      setMoveRender(axis);
+      updateStatus(mode);
+    }
+  }
+
+  function enterMoveMode(axis) {
+    // Toggle off if the same axis button is clicked again.
+    setMoveAxis(moveAxis === axis ? null : axis);
+  }
+
+  function getIntersection(clientX, clientY, meshes = cubeFaceMeshes) {
     const rect = renderer.domElement.getBoundingClientRect();
     pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(pointer, camera);
-    return raycaster.intersectObjects(cubeFaceMeshes, false);
+    return raycaster.intersectObjects(meshes, false);
   }
 
   function handleEdit(clientX, clientY) {
     if (busy) return; // edits are suspended while a realization runs
+    if (moveAxis !== null) return; // move mode has its own drag interaction
     const hits = getIntersection(clientX, clientY);
     if (!hits.length) return;
 
@@ -812,9 +1074,185 @@ async function main() {
     if (addVoxel(nx, ny, nz)) updateStatus(mode);
   }
 
+  // --- Move-mode drag state and geometry -----------------------------------
+  const SNAP_THRESHOLD = 0.3; // commit only if drag value is within this of a plane
+  let drag = null; // { axis, face, corners, planes, dragValue, snapValue }
+
+  // Closest edit-axis value on the line through `linePoint` (parallel to
+  // `axis`) to the pointer ray — the drag value. Derived by minimizing the
+  // distance between the ray and that axis-parallel line.
+  const _rayOrigin = new THREE.Vector3();
+  const _rayDir = new THREE.Vector3();
+  function dragValueFromRay(clientX, clientY, axis, linePoint) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    _rayOrigin.copy(raycaster.ray.origin);
+    _rayDir.copy(raycaster.ray.direction);
+
+    // Line L: linePoint + t*e_axis. Ray R: o + s*d. Solve for t minimizing
+    // |R - L|^2. With e a unit basis vector, using the standard closest-points
+    // -of-two-lines formula.
+    const e = [0, 0, 0];
+    e[axis] = 1;
+    const d = [_rayDir.x, _rayDir.y, _rayDir.z];
+    const o = [_rayOrigin.x, _rayOrigin.y, _rayOrigin.z];
+    // w0 points from the ray's origin to the axis line's point; the standard
+    // two-line closest-approach formula below is written for this direction
+    // (the reverse, o - linePoint, negates t and drags the face backward).
+    const w0 = [linePoint[0] - o[0], linePoint[1] - o[1], linePoint[2] - o[2]];
+    const dot = (u, v) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    const a = 1; // dot(e,e)
+    const b = dot(e, d);
+    const c = dot(d, d);
+    const dd = dot(e, w0);
+    const ee = dot(d, w0);
+    const denom = a * c - b * b;
+    // t is the parameter along the axis line (the value offset from linePoint).
+    const t = Math.abs(denom) < 1e-8 ? 0 : (b * ee - c * dd) / denom;
+    return linePoint[axis] + t;
+  }
+
+  function nearestPlane(value, planes) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of planes) {
+      const dist = Math.abs(p - value);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = p;
+      }
+    }
+    return { plane: best, dist: bestDist };
+  }
+
+  // Render the temp face's quads (a 60%-transparent copy of the grabbed face)
+  // at the given edit-axis value.
+  const _tempMatrix = new THREE.Matrix4();
+  const _tempPos = new THREE.Vector3();
+  const _tempQuat = new THREE.Quaternion();
+  const _tempScale = new THREE.Vector3(1, 1, 1);
+  function renderTempFace(atValue) {
+    const { axis, quadCenters } = drag;
+    const signQuat = faceQuaternions[axis][0]; // orientation doesn't matter (DoubleSide)
+    tempFaceMesh.count = quadCenters.length;
+    for (let i = 0; i < quadCenters.length; i++) {
+      const c = quadCenters[i];
+      _tempPos.set(c[0], c[1], c[2]);
+      _tempPos.setComponent(axis, atValue); // slide the copy along the edit axis
+      _tempQuat.copy(signQuat);
+      _tempMatrix.compose(_tempPos, _tempQuat, _tempScale);
+      tempFaceMesh.setMatrixAt(i, _tempMatrix);
+    }
+    tempFaceMesh.instanceMatrix.needsUpdate = true;
+    tempFaceMesh.computeBoundingSphere();
+  }
+
+  function startDrag(axis, hitId) {
+    const face = connectedFace(axis, hitId);
+    const values = computeAvailablePlanes(axis, face.coord);
+    if (!values.length) return false;
+
+    // Center the available-plane grids over the face square the raycast
+    // originally hit (the other two axes fixed; each plane sits at its value
+    // on the edit axis).
+    const hitCenter = boundaryFaceInfoByAxis[axis][hitId].center;
+    const centerOther = [hitCenter[0], hitCenter[1], hitCenter[2]];
+
+    // Quad centers (in the face's current plane) so the temp face can be
+    // re-rendered at any edit-axis value. A boundary quad's center sits exactly
+    // on the integer edit-axis plane (center[axis] === face.coord).
+    const quadCenters = face.quadIds.map((id) => {
+      const c = boundaryFaceInfoByAxis[axis][id].center;
+      return [c[0], c[1], c[2]];
+    });
+
+    drag = {
+      axis,
+      face,
+      planes: values,
+      quadCenters,
+      linePoint: [...quadCenters[0]],
+      dragValue: face.coord,
+      snapValue: face.coord,
+    };
+    controls.enabled = false;
+    tempFaceMaterial.emissiveIntensity = TEMP_FACE_EMISSIVE_DIM;
+    showAvailablePlanes(axis, values, centerOther);
+    renderTempFace(face.coord);
+    return true;
+  }
+
+  function updateDrag(clientX, clientY) {
+    const value = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
+    drag.dragValue = value;
+    const { plane, dist } = nearestPlane(value, drag.planes);
+    // Snap the rendered temp face to a nearby available plane, but keep the raw
+    // value so dragging past it can reach the next plane.
+    drag.snapValue = dist <= 0.5 ? plane : value;
+    // Brighten the face once it's within the commit threshold of a plane — the
+    // range where releasing would actually snap-and-commit there.
+    tempFaceMaterial.emissiveIntensity =
+      dist <= SNAP_THRESHOLD ? TEMP_FACE_EMISSIVE_BRIGHT : TEMP_FACE_EMISSIVE_DIM;
+    renderTempFace(drag.snapValue);
+  }
+
+  function commitDrag() {
+    const { axis, face, dragValue, planes, quadCenters } = drag;
+    const { plane, dist } = nearestPlane(dragValue, planes);
+    endDrag();
+    if (plane === null || dist > SNAP_THRESHOLD) return; // not near a plane: cancel
+
+    const C = face.coord; // the face's current edit-axis plane
+    const P = plane; // the destination plane
+    if (P === C) return;
+
+    // Moving the face from plane C to plane P sweeps, in each column (grid
+    // line ∥ the edit axis) the face touches, the cube-cells whose edit-axis
+    // least-corner lies in [min(C,P), max(C,P)-1]. XOR (toggle) the presence
+    // of every swept cell: this both adds cells the face vacated on one side
+    // and removes/re-adds as it crosses interior boundaries — the parity flips
+    // at each boundary automatically. The other two coordinates never change.
+    // Operate directly on the cube set, then recompute the skeleton once.
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
+    const kLo = Math.min(C, P);
+    const kHi = Math.max(C, P) - 1;
+
+    for (const c of quadCenters) {
+      // The quad center is at a cube center on the two in-plane axes, so its
+      // least-corner there is center - 0.5 (an integer).
+      const fixed = [0, 0, 0];
+      fixed[ua] = Math.round(c[ua] - 0.5);
+      fixed[ub] = Math.round(c[ub] - 0.5);
+      for (let k = kLo; k <= kHi; k++) {
+        const cell = [fixed[0], fixed[1], fixed[2]];
+        cell[axis] = k;
+        const [x, y, z] = cell;
+        if (hasVoxel(x, y, z)) removeVoxelRaw(x, y, z);
+        else addVoxelRaw(x, y, z);
+      }
+    }
+
+    updateBrinkSkeleton();
+    updateStatus(mode);
+  }
+
+  function endDrag() {
+    drag = null;
+    controls.enabled = true;
+    tempFaceMesh.count = 0;
+    hideAvailablePlanes();
+  }
+
+  function cancelDrag() {
+    if (drag) endDrag();
+  }
+
   buildBtn.addEventListener('click', () => setMode('build'));
   destroyBtn.addEventListener('click', () => setMode('destroy'));
   resetBtn.addEventListener('click', () => reset());
+  moveBtns.forEach((btn, axis) => btn.addEventListener('click', () => enterMoveMode(axis)));
 
   saveBtn.addEventListener('click', () => save());
   saveAsBtn.addEventListener('click', () => saveAs());
@@ -835,10 +1273,31 @@ async function main() {
   renderer.domElement.addEventListener('pointerdown', (event) => {
     downX = event.clientX;
     downY = event.clientY;
+
+    // In move mode, grabbing a rendered (edit-axis-normal) face starts a drag
+    // and suspends the trackball so the camera doesn't rotate mid-drag.
+    if (moveAxis !== null && !busy) {
+      const hits = getIntersection(event.clientX, event.clientY, [cubeFaceMeshes[moveAxis]]);
+      const hit = hits[0];
+      if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
+        if (startDrag(moveAxis, hit.instanceId)) {
+          hoverOutline.visible = false;
+          event.preventDefault();
+        }
+      }
+    }
   });
 
   renderer.domElement.addEventListener('pointermove', (event) => {
-    const hits = getIntersection(event.clientX, event.clientY);
+    if (drag) {
+      updateDrag(event.clientX, event.clientY);
+      return;
+    }
+
+    // Hover highlight: only over grabbable faces. In move mode that's the
+    // edit-axis-normal mesh; otherwise any boundary face.
+    const meshes = moveAxis !== null ? [cubeFaceMeshes[moveAxis]] : cubeFaceMeshes;
+    const hits = getIntersection(event.clientX, event.clientY, meshes);
     if (!hits.length || hits[0].instanceId === undefined || hits[0].instanceId === null) {
       hoverOutline.visible = false;
       return;
@@ -853,6 +1312,10 @@ async function main() {
   });
 
   renderer.domElement.addEventListener('pointerup', (event) => {
+    if (drag) {
+      commitDrag();
+      return;
+    }
     const dist = Math.hypot(event.clientX - downX, event.clientY - downY);
     if (dist > 3) return;
     handleEdit(event.clientX, event.clientY);
