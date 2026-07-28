@@ -7,11 +7,14 @@
   - modifier keys for mouse
   - table for controls (and touch)
 - fix face drag:
-  - face skeleton is the target
+  - face skeleton is the target, not filled squares
   - test square fill algorithm
   - just one mode; ray determines face and drag axis
+  - show "have room" planes in orange, where no face collision, allow drop
 - change mode controls
   - modifier keys for mouse
   - mode selector for touch
 - fix layout for phones
 - add undo/redo support
+- condense / dilate functions
+- insert plane
