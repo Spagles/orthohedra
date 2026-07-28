@@ -1,5 +1,8 @@
 import * as THREE from "https://esm.sh/three@0.172.0";
 import { TrackballControls } from "https://esm.sh/three@0.172.0/examples/jsm/controls/TrackballControls.js";
+import { Line2 } from "https://esm.sh/three@0.172.0/examples/jsm/lines/Line2.js";
+import { LineMaterial } from "https://esm.sh/three@0.172.0/examples/jsm/lines/LineMaterial.js";
+import { LineSegmentsGeometry } from "https://esm.sh/three@0.172.0/examples/jsm/lines/LineSegmentsGeometry.js";
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 
@@ -180,82 +183,184 @@ async function main() {
   scene.add(hoverOutline);
 
   // --- Move mode visuals ---------------------------------------------------
-  // "Available planes": large gridded squares drawn at edit-axis values that
-  // hold no boundary face orthogonal to the edit axis — the valid destinations
-  // a dragged face can snap to. One reusable pool of plane helpers, oriented
-  // to face along the current edit axis and positioned per available value.
-  const AVAIL_PLANE_SIZE = 7; // 7x7 unit squares
+  // Both the available planes and the drag indicator are drawn as the DRAGGED
+  // FACE's own footprint (its set of unit quads), not generic grids: the
+  // available planes show where that footprint would land at each valid
+  // destination, as purple outlines in place in the column; the drag indicator
+  // is an outline while free-floating and fills solid once it snaps.
   const AVAIL_PLANE_COLOR = 0x9b5cff; // purple
-  const availablePlanesGroup = new THREE.Group();
-  availablePlanesGroup.visible = false;
-  scene.add(availablePlanesGroup);
-  const availablePlanePool = [];
 
-  function getAvailablePlaneHelper(i) {
-    if (availablePlanePool[i]) return availablePlanePool[i];
-    // A purple grid of lines (7x7 unit cells) in the XY plane (normal +Z),
-    // rotated per edit axis when positioned. Grid lines only — no fill quad.
-    const grid = new THREE.GridHelper(AVAIL_PLANE_SIZE, AVAIL_PLANE_SIZE, AVAIL_PLANE_COLOR, AVAIL_PLANE_COLOR);
-    // GridHelper lies in the XZ plane (normal +Y); tip it up to the XY plane
-    // (normal +Z) so the group's per-axis quaternion below aims the normal.
-    grid.rotation.x = Math.PI / 2;
-    const group = new THREE.Group();
-    group.add(grid);
-    availablePlanesGroup.add(group);
-    availablePlanePool[i] = group;
-    return group;
-  }
-
-  // Orient an available plane (default normal +Z) to face along `axis`, and
-  // center it on `axis`=value over the assembly center on the other two axes.
+  // Orientation to face the footprint squares along `axis` (default normal +Z).
   const availPlaneQuaternions = [
     new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2), // +Z -> +X
     new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2), // +Z -> +Y
     new THREE.Quaternion(), // +Z -> +Z
   ];
 
-  function showAvailablePlanes(axis, values, centerOther) {
-    availablePlanesGroup.visible = true;
-    for (let i = 0; i < values.length; i++) {
-      const group = getAvailablePlaneHelper(i);
-      group.visible = true;
-      group.quaternion.copy(availPlaneQuaternions[axis]);
-      const p = [centerOther[0], centerOther[1], centerOther[2]];
-      p[axis] = values[i];
-      group.position.set(p[0], p[1], p[2]);
+  // Build a merged triangle position array for the SOLID fill: the dragged
+  // face's footprint (each quad center in `quadCenters`, oriented for `axis`)
+  // stamped from the `base` template (unit-quad-local triangle positions) at
+  // every edit-axis value in `values`.
+  const _outlineMatrix = new THREE.Matrix4();
+  const _outlineScale = new THREE.Vector3(1, 1, 1);
+  const _footPos = new THREE.Vector3();
+  const _footVert = new THREE.Vector3();
+  function footprintPositions(base, axis, quadCenters, values) {
+    const quat = availPlaneQuaternions[axis];
+    const merged = [];
+    for (const value of values) {
+      for (const c of quadCenters) {
+        _footPos.set(c[0], c[1], c[2]);
+        _footPos.setComponent(axis, value);
+        _outlineMatrix.compose(_footPos, quat, _outlineScale);
+        for (let i = 0; i < base.length; i += 3) {
+          _footVert.set(base[i], base[i + 1], base[i + 2]).applyMatrix4(_outlineMatrix);
+          merged.push(_footVert.x, _footVert.y, _footVert.z);
+        }
+      }
     }
-    for (let i = values.length; i < availablePlanePool.length; i++) {
-      if (availablePlanePool[i]) availablePlanePool[i].visible = false;
+    return merged;
+  }
+
+  // Build a merged line position array for the footprint's OUTER PERIMETER
+  // only (no interior grid lines between adjacent quads). Each quad contributes
+  // its 4 unit edges; an edge shared by two quads is interior and cancels, so
+  // only edges used an odd number of times survive. `quadCenters` are the quad
+  // centers in the face's plane; the perimeter is drawn at every edit-axis
+  // value in `values`.
+  function perimeterPositions(axis, quadCenters, values) {
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
+    const merged = [];
+    for (const value of values) {
+      // Collect this plane's unit edges keyed canonically; XOR out shared ones.
+      const edges = new Map(); // key -> [p0, p1] (each an [ua,ub] integer pair)
+      const addEdge = (au, av, bu, bv) => {
+        const key = au <= bu && av <= bv ? `${au},${av}|${bu},${bv}` : `${bu},${bv}|${au},${av}`;
+        if (edges.has(key)) edges.delete(key);
+        else edges.set(key, [au, av, bu, bv]);
+      };
+      for (const c of quadCenters) {
+        // Integer corner coords on the two in-plane axes (center ± 0.5).
+        const u0 = Math.round(c[ua] - 0.5);
+        const u1 = u0 + 1;
+        const v0 = Math.round(c[ub] - 0.5);
+        const v1 = v0 + 1;
+        addEdge(u0, v0, u1, v0); // bottom
+        addEdge(u1, v0, u1, v1); // right
+        addEdge(u1, v1, u0, v1); // top
+        addEdge(u0, v1, u0, v0); // left
+      }
+      for (const [, [au, av, bu, bv]] of edges) {
+        const p = [0, 0, 0];
+        p[axis] = value;
+        p[ua] = au;
+        p[ub] = av;
+        merged.push(p[0], p[1], p[2]);
+        p[ua] = bu;
+        p[ub] = bv;
+        merged.push(p[0], p[1], p[2]);
+      }
     }
+    return merged;
+  }
+
+  // Outlines use three's fat-line classes (Line2 + LineMaterial) for genuine
+  // screen-space thickness — LineBasicMaterial.linewidth is clamped to 1px by
+  // WebGL. `linewidth` is in world/pixel units per LineMaterial; resolution
+  // must track the canvas size (kept current on resize below). `replaceOutline`
+  // swaps the LineSegmentsGeometry from a flat position array.
+  const OUTLINE_LINEWIDTH = 4; // ~twice the former 1px hairline, in device px
+  const availableOutlineMaterial = new LineMaterial({
+    color: AVAIL_PLANE_COLOR,
+    linewidth: OUTLINE_LINEWIDTH,
+  });
+  const dragOutlineMaterial = new LineMaterial({ color: 0xd8b8ff, linewidth: OUTLINE_LINEWIDTH });
+  const outlineMaterials = [availableOutlineMaterial, dragOutlineMaterial];
+  function updateOutlineResolution() {
+    for (const m of outlineMaterials) m.resolution.set(window.innerWidth, window.innerHeight);
+  }
+  updateOutlineResolution();
+
+  function makeOutline(material, renderOrder) {
+    const line = new Line2(new LineSegmentsGeometry(), material);
+    line.frustumCulled = false;
+    line.renderOrder = renderOrder;
+    line.visible = false;
+    scene.add(line);
+    return line;
+  }
+
+  function replaceOutline(line, positions) {
+    line.geometry.dispose();
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(positions);
+    line.geometry = geo;
+  }
+
+  // Available planes: the dragged footprint drawn as purple outlines at every
+  // valid destination value (in place in the column).
+  const availableOutlines = makeOutline(availableOutlineMaterial, 2);
+
+  function showAvailablePlanes(axis, values, quadCenters) {
+    replaceOutline(availableOutlines, perimeterPositions(axis, quadCenters, values));
+    availableOutlines.visible = true;
   }
 
   function hideAvailablePlanes() {
-    availablePlanesGroup.visible = false;
-    for (const g of availablePlanePool) if (g) g.visible = false;
+    availableOutlines.visible = false;
   }
 
-  // Temp face: a solid copy of the dragged face's unit quads that moves
-  // continuously with the drag (snapping to available planes), colored the
-  // same purple as the available-plane grids. The grids are unlit lines, so we
-  // give this the plane color as emissive too, matching their appearance
-  // regardless of scene lighting. Its own instanced mesh so an arbitrary
-  // number of quads can be shown.
-  const TEMP_FACE_EMISSIVE_DIM = 0.3; // free-floating, not on a plane
-  const TEMP_FACE_EMISSIVE_BRIGHT = 2.2; // snapped onto an available plane
-  const tempFaceMaterial = new THREE.MeshStandardMaterial({
+  // Drag indicator — two forms of the dragged footprint that move with the
+  // drag: a purple OUTLINE while free-floating, and a solid FILL once it snaps.
+  // Only one is visible at a time. Both are single meshes (the footprint is a
+  // handful of quads — no instancing needed) whose geometry is rebuilt as the
+  // drag moves.
+  const TEMP_FACE_EMISSIVE = 2.2;
+  const dragFillMaterial = new THREE.MeshStandardMaterial({
     color: AVAIL_PLANE_COLOR,
     emissive: AVAIL_PLANE_COLOR,
-    emissiveIntensity: TEMP_FACE_EMISSIVE_DIM,
+    emissiveIntensity: TEMP_FACE_EMISSIVE,
     roughness: 0.5,
     metalness: 0.05,
     side: THREE.DoubleSide,
   });
-  const tempFaceMesh = new THREE.InstancedMesh(faceGeometry, tempFaceMaterial, FACE_MAX_INSTANCES);
-  tempFaceMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  tempFaceMesh.frustumCulled = false;
-  tempFaceMesh.renderOrder = 2;
-  tempFaceMesh.count = 0;
-  scene.add(tempFaceMesh);
+  const dragFillMesh = new THREE.Mesh(new THREE.BufferGeometry(), dragFillMaterial);
+  dragFillMesh.frustumCulled = false;
+  dragFillMesh.renderOrder = 3;
+  dragFillMesh.visible = false;
+  scene.add(dragFillMesh);
+
+  const dragOutlineMesh = makeOutline(dragOutlineMaterial, 3);
+
+  // Replace a mesh's geometry from a flat position array. `withNormals` is set
+  // for the solid fill (which needs lighting) and left off for line outlines.
+  function replaceGeometry(mesh, positions, withNormals) {
+    mesh.geometry.dispose();
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    if (withNormals) geo.computeVertexNormals();
+    mesh.geometry = geo;
+  }
+
+  // Local-space triangle template stamped per footprint quad for the fill.
+  const squareFillBase = faceGeometry.toNonIndexed().attributes.position.array;
+
+  // Draw the moving drag indicator at `atValue`: a solid fill when snapped to a
+  // plane, otherwise a free-floating outline. Only the active form is shown.
+  function renderDragIndicator(axis, quadCenters, atValue, snapped) {
+    if (snapped) {
+      replaceGeometry(dragFillMesh, footprintPositions(squareFillBase, axis, quadCenters, [atValue]), true);
+    } else {
+      replaceOutline(dragOutlineMesh, perimeterPositions(axis, quadCenters, [atValue]));
+    }
+    dragFillMesh.visible = snapped;
+    dragOutlineMesh.visible = !snapped;
+  }
+
+  function hideDragIndicator() {
+    dragFillMesh.visible = false;
+    dragOutlineMesh.visible = false;
+  }
 
   // Brink skeleton rendering: white spheres at vertices, and
   // cylinders for edges colored red/yellow/blue by their X/Y/Z axis.
@@ -1076,7 +1181,7 @@ async function main() {
 
   // --- Move-mode drag state and geometry -----------------------------------
   const SNAP_THRESHOLD = 0.3; // commit only if drag value is within this of a plane
-  let drag = null; // { axis, face, corners, planes, dragValue, snapValue }
+  let drag = null; // { axis, face, planes, quadCenters, linePoint, dragValue }
 
   // Closest edit-axis value on the line through `linePoint` (parallel to
   // `axis`) to the pointer ray — the drag value. Derived by minimizing the
@@ -1127,42 +1232,14 @@ async function main() {
     return { plane: best, dist: bestDist };
   }
 
-  // Render the temp face's quads (a 60%-transparent copy of the grabbed face)
-  // at the given edit-axis value.
-  const _tempMatrix = new THREE.Matrix4();
-  const _tempPos = new THREE.Vector3();
-  const _tempQuat = new THREE.Quaternion();
-  const _tempScale = new THREE.Vector3(1, 1, 1);
-  function renderTempFace(atValue) {
-    const { axis, quadCenters } = drag;
-    const signQuat = faceQuaternions[axis][0]; // orientation doesn't matter (DoubleSide)
-    tempFaceMesh.count = quadCenters.length;
-    for (let i = 0; i < quadCenters.length; i++) {
-      const c = quadCenters[i];
-      _tempPos.set(c[0], c[1], c[2]);
-      _tempPos.setComponent(axis, atValue); // slide the copy along the edit axis
-      _tempQuat.copy(signQuat);
-      _tempMatrix.compose(_tempPos, _tempQuat, _tempScale);
-      tempFaceMesh.setMatrixAt(i, _tempMatrix);
-    }
-    tempFaceMesh.instanceMatrix.needsUpdate = true;
-    tempFaceMesh.computeBoundingSphere();
-  }
-
   function startDrag(axis, hitId) {
     const face = connectedFace(axis, hitId);
     const values = computeAvailablePlanes(axis, face.coord);
     if (!values.length) return false;
 
-    // Center the available-plane grids over the face square the raycast
-    // originally hit (the other two axes fixed; each plane sits at its value
-    // on the edit axis).
-    const hitCenter = boundaryFaceInfoByAxis[axis][hitId].center;
-    const centerOther = [hitCenter[0], hitCenter[1], hitCenter[2]];
-
-    // Quad centers (in the face's current plane) so the temp face can be
-    // re-rendered at any edit-axis value. A boundary quad's center sits exactly
-    // on the integer edit-axis plane (center[axis] === face.coord).
+    // Quad centers (in the face's current plane) — the footprint reused for
+    // the drag indicator and the available-plane outlines. A boundary quad's
+    // center sits exactly on the integer edit-axis plane (center[axis] === coord).
     const quadCenters = face.quadIds.map((id) => {
       const c = boundaryFaceInfoByAxis[axis][id].center;
       return [c[0], c[1], c[2]];
@@ -1175,12 +1252,10 @@ async function main() {
       quadCenters,
       linePoint: [...quadCenters[0]],
       dragValue: face.coord,
-      snapValue: face.coord,
     };
     controls.enabled = false;
-    tempFaceMaterial.emissiveIntensity = TEMP_FACE_EMISSIVE_DIM;
-    showAvailablePlanes(axis, values, centerOther);
-    renderTempFace(face.coord);
+    showAvailablePlanes(axis, values, quadCenters);
+    renderDragIndicator(axis, quadCenters, face.coord, false);
     return true;
   }
 
@@ -1188,13 +1263,11 @@ async function main() {
     const value = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
     drag.dragValue = value;
     const { plane, dist } = nearestPlane(value, drag.planes);
-    // Within the snap threshold the temp face snaps to the plane (and brightens
-    // to signal a release would commit there); otherwise it follows the raw
-    // value, so dragging past a plane can reach the next one.
+    // Within the snap threshold the indicator snaps to the plane and fills
+    // solid (a release would commit there); otherwise it follows the raw value
+    // as an outline, so dragging past a plane can reach the next one.
     const snapped = dist <= SNAP_THRESHOLD;
-    drag.snapValue = snapped ? plane : value;
-    tempFaceMaterial.emissiveIntensity = snapped ? TEMP_FACE_EMISSIVE_BRIGHT : TEMP_FACE_EMISSIVE_DIM;
-    renderTempFace(drag.snapValue);
+    renderDragIndicator(drag.axis, drag.quadCenters, snapped ? plane : value, snapped);
   }
 
   function commitDrag() {
@@ -1240,7 +1313,7 @@ async function main() {
   function endDrag() {
     drag = null;
     controls.enabled = true;
-    tempFaceMesh.count = 0;
+    hideDragIndicator();
     hideAvailablePlanes();
   }
 
@@ -1324,6 +1397,8 @@ async function main() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    // Fat lines need their pixel resolution kept in sync with the canvas.
+    updateOutlineResolution();
     // Unlike OrbitControls, TrackballControls caches the canvas's screen
     // rect for its rotate/pan/zoom math and needs to be told explicitly
     // when it changes, or dragging becomes misaligned with the cursor.
