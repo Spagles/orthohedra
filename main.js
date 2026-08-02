@@ -1119,7 +1119,8 @@ async function main() {
   setRenderMode(initialRenderMode);
 
   if (saved?.positions?.length) {
-    for (const { x, y, z } of saved.positions) addVoxel(x, y, z);
+    for (const { x, y, z } of saved.positions) addVoxelRaw(x, y, z);
+    updateBrinkSkeleton();
   } else {
     addVoxel(0, 0, 0);
   }
