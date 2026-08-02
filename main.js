@@ -1005,8 +1005,9 @@ async function main() {
   }
 
   function reset() {
-    for (const { x, y, z } of [...positions]) removeVoxel(x, y, z);
-    addVoxel(0, 0, 0);
+    for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+    addVoxelRaw(0, 0, 0);
+    updateBrinkSkeleton();
     updateStatus(mode);
   }
 
