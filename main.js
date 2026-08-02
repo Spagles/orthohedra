@@ -427,6 +427,7 @@ async function main() {
   // face by the parity invariants — perpendicular crossing faces aren't merged.
   function connectedFace(axis, startId) {
     const faces = boundaryFaceInfoByAxis[axis];
+    if (!faces || !faces[startId]) return null;
     const coord = Math.round(faces[startId].center[axis]);
     const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
 
