@@ -197,68 +197,23 @@ async function main() {
     new THREE.Quaternion(), // +Z -> +Z
   ];
 
-  // Build a merged triangle position array for the SOLID fill: the dragged
-  // face's footprint (each quad center in `quadCenters`, oriented for `axis`)
-  // stamped from the `base` template (unit-quad-local triangle positions) at
-  // every edit-axis value in `values`.
-  const _outlineMatrix = new THREE.Matrix4();
-  const _outlineScale = new THREE.Vector3(1, 1, 1);
-  const _footPos = new THREE.Vector3();
-  const _footVert = new THREE.Vector3();
-  function footprintPositions(base, axis, quadCenters, values) {
-    const quat = availPlaneQuaternions[axis];
-    const merged = [];
-    for (const value of values) {
-      for (const c of quadCenters) {
-        _footPos.set(c[0], c[1], c[2]);
-        _footPos.setComponent(axis, value);
-        _outlineMatrix.compose(_footPos, quat, _outlineScale);
-        for (let i = 0; i < base.length; i += 3) {
-          _footVert.set(base[i], base[i + 1], base[i + 2]).applyMatrix4(_outlineMatrix);
-          merged.push(_footVert.x, _footVert.y, _footVert.z);
-        }
-      }
-    }
-    return merged;
-  }
-
-  // Build a merged line position array for the footprint's OUTER PERIMETER
-  // only (no interior grid lines between adjacent quads). Each quad contributes
-  // its 4 unit edges; an edge shared by two quads is interior and cancels, so
-  // only edges used an odd number of times survive. `quadCenters` are the quad
-  // centers in the face's plane; the perimeter is drawn at every edit-axis
-  // value in `values`.
-  function perimeterPositions(axis, quadCenters, values) {
+  // The dragged face and its available destinations are drawn directly from the
+  // face's brink-skeleton EDGES: `segments` are its in-plane [au,av,bu,bv] edge
+  // endpoints (on the two non-edit axes). `edgePositions` lifts them into world
+  // space at the given edit-axis value(s) as a flat line-segment array.
+  const _segP = [0, 0, 0];
+  function edgePositions(axis, segments, values) {
     const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
     const merged = [];
     for (const value of values) {
-      // Collect this plane's unit edges keyed canonically; XOR out shared ones.
-      const edges = new Map(); // key -> [p0, p1] (each an [ua,ub] integer pair)
-      const addEdge = (au, av, bu, bv) => {
-        const key = au <= bu && av <= bv ? `${au},${av}|${bu},${bv}` : `${bu},${bv}|${au},${av}`;
-        if (edges.has(key)) edges.delete(key);
-        else edges.set(key, [au, av, bu, bv]);
-      };
-      for (const c of quadCenters) {
-        // Integer corner coords on the two in-plane axes (center ± 0.5).
-        const u0 = Math.round(c[ua] - 0.5);
-        const u1 = u0 + 1;
-        const v0 = Math.round(c[ub] - 0.5);
-        const v1 = v0 + 1;
-        addEdge(u0, v0, u1, v0); // bottom
-        addEdge(u1, v0, u1, v1); // right
-        addEdge(u1, v1, u0, v1); // top
-        addEdge(u0, v1, u0, v0); // left
-      }
-      for (const [, [au, av, bu, bv]] of edges) {
-        const p = [0, 0, 0];
-        p[axis] = value;
-        p[ua] = au;
-        p[ub] = av;
-        merged.push(p[0], p[1], p[2]);
-        p[ua] = bu;
-        p[ub] = bv;
-        merged.push(p[0], p[1], p[2]);
+      _segP[axis] = value;
+      for (const [au, av, bu, bv] of segments) {
+        _segP[ua] = au;
+        _segP[ub] = av;
+        merged.push(_segP[0], _segP[1], _segP[2]);
+        _segP[ua] = bu;
+        _segP[ub] = bv;
+        merged.push(_segP[0], _segP[1], _segP[2]);
       }
     }
     return merged;
@@ -270,6 +225,7 @@ async function main() {
   // must track the canvas size (kept current on resize below). `replaceOutline`
   // swaps the LineSegmentsGeometry from a flat position array.
   const OUTLINE_LINEWIDTH = 4; // ~twice the former 1px hairline, in device px
+  const DRAG_LINEWIDTH_SNAPPED = 8; // thicker + brighter when snapped to a plane
   const availableOutlineMaterial = new LineMaterial({
     color: AVAIL_PLANE_COLOR,
     linewidth: OUTLINE_LINEWIDTH,
@@ -297,12 +253,12 @@ async function main() {
     line.geometry = geo;
   }
 
-  // Available planes: the dragged footprint drawn as purple outlines at every
-  // valid destination value (in place in the column).
+  // Available planes: the dragged face's edges drawn at every valid destination
+  // value (in place in the column).
   const availableOutlines = makeOutline(availableOutlineMaterial, 2);
 
-  function showAvailablePlanes(axis, values, quadCenters) {
-    replaceOutline(availableOutlines, perimeterPositions(axis, quadCenters, values));
+  function showAvailablePlanes(axis, values, segments) {
+    replaceOutline(availableOutlines, edgePositions(axis, segments, values));
     availableOutlines.visible = true;
   }
 
@@ -310,55 +266,18 @@ async function main() {
     availableOutlines.visible = false;
   }
 
-  // Drag indicator — two forms of the dragged footprint that move with the
-  // drag: a purple OUTLINE while free-floating, and a solid FILL once it snaps.
-  // Only one is visible at a time. Both are single meshes (the footprint is a
-  // handful of quads — no instancing needed) whose geometry is rebuilt as the
-  // drag moves.
-  const TEMP_FACE_EMISSIVE = 2.2;
-  const dragFillMaterial = new THREE.MeshStandardMaterial({
-    color: AVAIL_PLANE_COLOR,
-    emissive: AVAIL_PLANE_COLOR,
-    emissiveIntensity: TEMP_FACE_EMISSIVE,
-    roughness: 0.5,
-    metalness: 0.05,
-    side: THREE.DoubleSide,
-  });
-  const dragFillMesh = new THREE.Mesh(new THREE.BufferGeometry(), dragFillMaterial);
-  dragFillMesh.frustumCulled = false;
-  dragFillMesh.renderOrder = 3;
-  dragFillMesh.visible = false;
-  scene.add(dragFillMesh);
-
+  // Drag indicator: the dragged face's edges, moving with the drag. Brighter
+  // and thicker once it snaps to an available plane (a release would commit).
   const dragOutlineMesh = makeOutline(dragOutlineMaterial, 3);
 
-  // Replace a mesh's geometry from a flat position array. `withNormals` is set
-  // for the solid fill (which needs lighting) and left off for line outlines.
-  function replaceGeometry(mesh, positions, withNormals) {
-    mesh.geometry.dispose();
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    if (withNormals) geo.computeVertexNormals();
-    mesh.geometry = geo;
-  }
-
-  // Local-space triangle template stamped per footprint quad for the fill.
-  const squareFillBase = faceGeometry.toNonIndexed().attributes.position.array;
-
-  // Draw the moving drag indicator at `atValue`: a solid fill when snapped to a
-  // plane, otherwise a free-floating outline. Only the active form is shown.
-  function renderDragIndicator(axis, quadCenters, atValue, snapped) {
-    if (snapped) {
-      replaceGeometry(dragFillMesh, footprintPositions(squareFillBase, axis, quadCenters, [atValue]), true);
-    } else {
-      replaceOutline(dragOutlineMesh, perimeterPositions(axis, quadCenters, [atValue]));
-    }
-    dragFillMesh.visible = snapped;
-    dragOutlineMesh.visible = !snapped;
+  function renderDragIndicator(axis, segments, atValue, snapped) {
+    replaceOutline(dragOutlineMesh, edgePositions(axis, segments, [atValue]));
+    dragOutlineMaterial.linewidth = snapped ? DRAG_LINEWIDTH_SNAPPED : OUTLINE_LINEWIDTH;
+    dragOutlineMaterial.color.set(snapped ? 0xffffff : 0xd8b8ff);
+    dragOutlineMesh.visible = true;
   }
 
   function hideDragIndicator() {
-    dragFillMesh.visible = false;
     dragOutlineMesh.visible = false;
   }
 
@@ -475,6 +394,7 @@ async function main() {
   // NORMAL is the edit axis (those never contain an edit-axis edge, so they can
   // be grabbed and dragged freely along that axis).
   let moveAxis = null;
+  let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
 
   function setMoveRender(axis) {
     for (let a = 0; a < 3; a++) {
@@ -489,73 +409,171 @@ async function main() {
     }
   }
 
-  // The 4 integer-lattice corners of a boundary face (a unit quad). `axis` is
-  // the face normal; `center` is its half-integer world center. The corners
-  // share the integer edit-axis coordinate center[axis] and vary by ±0.5 on
-  // the other two axes — those become integer corners of the quad.
-  function faceCorners(axis, center) {
-    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
-    const corners = [];
-    for (const du of [-0.5, 0.5]) {
-      for (const dv of [-0.5, 0.5]) {
-        const c = [center[0], center[1], center[2]];
-        c[ua] += du;
-        c[ub] += dv;
-        corners.push(c);
-      }
-    }
-    return corners;
-  }
-
-  const cornerKey = (c) => `${c[0]},${c[1]},${c[2]}`;
-
-  // Flood-fill the rendered boundary faces (on the edit-axis-normal mesh) that
-  // make up ONE brink-skeleton face containing the grabbed quad `startId`,
-  // returning those quads' instance ids and their shared integer edit-axis
-  // coordinate. Uses the faces already computed for rendering
-  // (boundaryFaceInfoByAxis) — no re-derivation.
+  // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
+  // at the grabbed quad's coordinate) that the grabbed quad belongs to. Returns
+  // { coord, vertexIndices, segments }: the shared edit-axis coordinate, the
+  // face's skeleton vertex indices (whose coordinate the drag shifts on commit),
+  // and its edges as in-plane [au,av,bu,bv] segments (for the drag visuals), or
+  // null if no bounding face was found.
   //
-  // Connectivity is by SHARED CORNER (which subsumes shared edge). A single
-  // brink-skeleton face may self-cross (a "pinched" hexagon that reads as two
-  // squares meeting at a point); its two lobes touch only at that crossing
-  // corner, so edge-adjacency alone would split them. By brink-skeleton rules
-  // a crossing point is non-extremal (even parity, not a skeleton vertex), so
-  // two genuinely distinct faces never share a corner — corner-adjacency
-  // merges a pinched face's lobes without ever merging separate faces.
+  // Algorithm (per the brink-skeleton parity rules): flood-fill EDGE-ADJACENT
+  // squares, never crossing an in-plane skeleton edge (a wall). A fill region
+  // either (A) reaches a skeleton VERTEX — which pins the containing face, and
+  // we STOP: the face is all the commit and visuals need — or (B) exhausts as a
+  // rectangle without one (e.g. an arm of a crossing where the bounding vertices
+  // cancelled by parity), whereupon we corner-jump into the next region. Jumping
+  // only NON-vertex corners (a diagonal there passes two walls at once, legal;
+  // over a vertex would cross a single wall) keeps the search inside the one
+  // face by the parity invariants — perpendicular crossing faces aren't merged.
   function connectedFace(axis, startId) {
     const faces = boundaryFaceInfoByAxis[axis];
     const coord = Math.round(faces[startId].center[axis]);
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
 
-    // Map each corner point (at this edit-axis coordinate) to the quads that
-    // touch it, so a flood-fill can hop between corner-adjacent quads.
-    const cornersOf = new Map();
-    const quadsAtCorner = new Map();
+    // Squares at this coordinate, keyed by in-plane integer least corner "u,v"
+    // (a quad center is the cube center in-plane, so least corner = center-0.5).
+    const squareId = new Map(); // "u,v" -> instance id
+    const uvOf = new Map(); // instance id -> [u, v]
     for (let id = 0; id < faces.length; id++) {
       if (Math.round(faces[id].center[axis]) !== coord) continue;
-      const corners = faceCorners(axis, faces[id].center);
-      cornersOf.set(id, corners);
-      for (const c of corners) {
-        const ck = cornerKey(c);
-        if (!quadsAtCorner.has(ck)) quadsAtCorner.set(ck, []);
-        quadsAtCorner.get(ck).push(id);
-      }
+      const u = Math.round(faces[id].center[ua] - 0.5);
+      const v = Math.round(faces[id].center[ub] - 0.5);
+      squareId.set(`${u},${v}`, id);
+      uvOf.set(id, [u, v]);
     }
 
-    const visited = new Set([startId]);
-    const stack = [startId];
-    while (stack.length) {
-      const id = stack.pop();
-      for (const c of cornersOf.get(id)) {
-        for (const nb of quadsAtCorner.get(cornerKey(c))) {
-          if (!visited.has(nb)) {
-            visited.add(nb);
-            stack.push(nb);
+    // In-plane skeleton data. IMPORTANT: a skeleton edge pairs CONSECUTIVE
+    // extremal vertices along a line, so it can span MANY unit cells and pass
+    // through intermediate non-vertex lattice points. We decompose every
+    // in-plane edge into its UNIT segments so per-cell wall lookups match, and
+    // key each unit segment canonically by its two endpoints.
+    const segKey = (au, av, bu, bv) =>
+      au < bu || (au === bu && av <= bv) ? `${au},${av}|${bu},${bv}` : `${bu},${bv}|${au},${av}`;
+    const walls = new Set(); // unit wall segments
+    const planeVertices = new Set(); // "u,v" of skeleton vertices in this plane
+    // Each in-plane face cycle, with the info the drag needs: the skeleton
+    // vertex indices to shift on commit, and its edges as in-plane [au,av,bu,bv]
+    // segments for the drag visuals. `faceAtVertex` maps a vertex "u,v" to the
+    // cycle(s) through it, so a reached vertex pins the containing face.
+    const planeFaces = []; // [{ vertexIndices:[], segments:[[au,av,bu,bv]] }]
+    const faceAtVertex = new Map(); // "u,v" -> planeFaces index
+    if (currentSkeleton) {
+      for (const [vi, vj] of currentSkeleton.edges) {
+        const a = currentSkeleton.vertices[vi];
+        const b = currentSkeleton.vertices[vj];
+        if (Math.round(a[axis]) !== coord || Math.round(b[axis]) !== coord) continue;
+        const au = Math.round(a[ua]);
+        const av = Math.round(a[ub]);
+        const bu = Math.round(b[ua]);
+        const bv = Math.round(b[ub]);
+        // Walk the (axis-aligned) edge one unit at a time.
+        const stepU = Math.sign(bu - au);
+        const stepV = Math.sign(bv - av);
+        let cu = au;
+        let cv = av;
+        while (cu !== bu || cv !== bv) {
+          walls.add(segKey(cu, cv, cu + stepU, cv + stepV));
+          cu += stepU;
+          cv += stepV;
+        }
+      }
+      for (const p of currentSkeleton.vertices) {
+        if (Math.round(p[axis]) === coord) planeVertices.add(`${Math.round(p[ua])},${Math.round(p[ub])}`);
+      }
+      for (const faceEdges of currentSkeleton.faces) {
+        const vertexIndices = new Set();
+        const segments = [];
+        let inPlane = true;
+        for (const ei of faceEdges) {
+          const [vi, vj] = currentSkeleton.edges[ei];
+          const a = currentSkeleton.vertices[vi];
+          const b = currentSkeleton.vertices[vj];
+          if (Math.round(a[axis]) !== coord || Math.round(b[axis]) !== coord) {
+            inPlane = false;
+            break;
           }
+          vertexIndices.add(vi);
+          vertexIndices.add(vj);
+          segments.push([Math.round(a[ua]), Math.round(a[ub]), Math.round(b[ua]), Math.round(b[ub])]);
+        }
+        if (!inPlane || !segments.length) continue;
+        const faceIdx = planeFaces.length;
+        planeFaces.push({ vertexIndices: [...vertexIndices], segments });
+        for (const vk of vertexIndices) {
+          const p = currentSkeleton.vertices[vk];
+          faceAtVertex.set(`${Math.round(p[ua])},${Math.round(p[ub])}`, faceIdx);
         }
       }
     }
 
-    return { quadIds: [...visited], coord };
+    // Is there a unit wall between corner points (au,av) and (bu,bv)?
+    const isWall = (au, av, bu, bv) => walls.has(segKey(au, av, bu, bv));
+
+    // Unit wall segment separating square (u,v) from its (du,dv) edge-neighbour.
+    const sharedWall = (u, v, du, dv) => {
+      if (du === 1) return isWall(u + 1, v, u + 1, v + 1);
+      if (du === -1) return isWall(u, v, u, v + 1);
+      if (dv === 1) return isWall(u, v + 1, u + 1, v + 1);
+      return isWall(u, v, u + 1, v);
+    };
+
+    const filled = new Set(); // instance ids visited (never retraced across jumps)
+    const jumpQueue = []; // seed square ids scheduled by corner-jumps
+    let foundFace = -1; // planeFaces index once a vertex is reached
+
+    // Return the in-plane face cycle through corner (cu,cv), if it's a vertex.
+    const faceAtCorner = (cu, cv) => faceAtVertex.get(`${cu},${cv}`);
+
+    // INNER LOOP: bounded edge-adjacency flood-fill of ONE region from a seed.
+    // Stops the whole search as soon as it reaches an in-plane skeleton VERTEX,
+    // which pins the containing face — that's all the commit and visuals need.
+    // Otherwise spreads across wall-free edges and SCHEDULES corner-jumps
+    // (diagonals across NON-vertex corners, where the hop passes two walls at
+    // once — legal — versus a vertex, where it would cross a single wall).
+    const fillRegion = (seedId) => {
+      const stack = [seedId];
+      filled.add(seedId);
+      while (stack.length) {
+        const id = stack.pop();
+        const [u, v] = uvOf.get(id);
+        // A skeleton vertex at any of this square's 4 corners identifies the face.
+        for (const [cu, cv] of [[u, v], [u + 1, v], [u, v + 1], [u + 1, v + 1]]) {
+          const f = faceAtCorner(cu, cv);
+          if (f !== undefined) {
+            foundFace = f;
+            return;
+          }
+        }
+        for (const [du, dv] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nb = squareId.get(`${u + du},${v + dv}`);
+          if (nb === undefined || filled.has(nb)) continue;
+          if (sharedWall(u, v, du, dv)) continue;
+          filled.add(nb);
+          stack.push(nb);
+        }
+        for (const [du, dv] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+          const cu = du === 1 ? u + 1 : u;
+          const cv = dv === 1 ? v + 1 : v;
+          if (planeVertices.has(`${cu},${cv}`)) continue; // never jump over a vertex
+          const nb = squareId.get(`${u + du},${v + dv}`);
+          if (nb !== undefined && !filled.has(nb)) jumpQueue.push(nb);
+        }
+      }
+    };
+
+    // OUTER LOOP: fill regions, draining scheduled corner-jumps, until a face is
+    // identified. Case A (a region reaches a vertex) pins the face; case B (a
+    // region exhausts as a rectangle without one — e.g. a crossing's arm) leads
+    // to a corner-jump into the next region.
+    fillRegion(startId);
+    while (foundFace < 0 && jumpQueue.length) {
+      const seed = jumpQueue.pop();
+      if (!filled.has(seed)) fillRegion(seed);
+    }
+
+    if (foundFace < 0) return null; // no bounding face found (shouldn't happen)
+    const { vertexIndices, segments } = planeFaces[foundFace];
+    return { coord, vertexIndices, segments };
   }
 
   // Edit-axis integer values that hold NO boundary face orthogonal to the edit
@@ -970,6 +988,7 @@ async function main() {
 
   function updateBrinkSkeleton() {
     const skeleton = computeBrinkSkeleton(positions);
+    currentSkeleton = skeleton;
     logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
     const V = skeleton.vertices.length;
@@ -1181,7 +1200,7 @@ async function main() {
 
   // --- Move-mode drag state and geometry -----------------------------------
   const SNAP_THRESHOLD = 0.3; // commit only if drag value is within this of a plane
-  let drag = null; // { axis, face, planes, quadCenters, linePoint, dragValue }
+  let drag = null; // { axis, face, skeleton, planes, linePoint, dragValue }
 
   // Closest edit-axis value on the line through `linePoint` (parallel to
   // `axis`) to the pointer ray — the drag value. Derived by minimizing the
@@ -1234,28 +1253,29 @@ async function main() {
 
   function startDrag(axis, hitId) {
     const face = connectedFace(axis, hitId);
+    if (!face) return false;
     const values = computeAvailablePlanes(axis, face.coord);
     if (!values.length) return false;
 
-    // Quad centers (in the face's current plane) — the footprint reused for
-    // the drag indicator and the available-plane outlines. A boundary quad's
-    // center sits exactly on the integer edit-axis plane (center[axis] === coord).
-    const quadCenters = face.quadIds.map((id) => {
-      const c = boundaryFaceInfoByAxis[axis][id].center;
-      return [c[0], c[1], c[2]];
-    });
+    // A point on the face (a segment endpoint lifted into the current plane)
+    // gives the axis-parallel line the pointer ray is projected onto.
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
+    const linePoint = [0, 0, 0];
+    linePoint[axis] = face.coord;
+    linePoint[ua] = face.segments[0][0];
+    linePoint[ub] = face.segments[0][1];
 
     drag = {
       axis,
       face,
+      skeleton: currentSkeleton, // captured so face.vertexIndices stay valid
       planes: values,
-      quadCenters,
-      linePoint: [...quadCenters[0]],
+      linePoint,
       dragValue: face.coord,
     };
     controls.enabled = false;
-    showAvailablePlanes(axis, values, quadCenters);
-    renderDragIndicator(axis, quadCenters, face.coord, false);
+    showAvailablePlanes(axis, values, face.segments);
+    renderDragIndicator(axis, face.segments, face.coord, false);
     return true;
   }
 
@@ -1263,51 +1283,44 @@ async function main() {
     const value = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
     drag.dragValue = value;
     const { plane, dist } = nearestPlane(value, drag.planes);
-    // Within the snap threshold the indicator snaps to the plane and fills
-    // solid (a release would commit there); otherwise it follows the raw value
-    // as an outline, so dragging past a plane can reach the next one.
+    // Within the snap threshold the indicator snaps to the plane and brightens
+    // (a release would commit there); otherwise it follows the raw value so
+    // dragging past a plane can reach the next one.
     const snapped = dist <= SNAP_THRESHOLD;
-    renderDragIndicator(drag.axis, drag.quadCenters, snapped ? plane : value, snapped);
+    renderDragIndicator(drag.axis, drag.face.segments, snapped ? plane : value, snapped);
   }
 
   function commitDrag() {
-    const { axis, face, dragValue, planes, quadCenters } = drag;
+    const { axis, face, skeleton, dragValue, planes } = drag;
     const { plane, dist } = nearestPlane(dragValue, planes);
     endDrag();
     if (plane === null || dist > SNAP_THRESHOLD) return; // not near a plane: cancel
+    if (plane === face.coord) return;
 
-    const C = face.coord; // the face's current edit-axis plane
-    const P = plane; // the destination plane
-    if (P === C) return;
+    // Move the dragged face to the target plane by shifting ONLY its skeleton
+    // vertices' edit-axis coordinate, then recompute the whole cube array from
+    // the modified skeleton — exactly the "load skeleton" path
+    // (fillCubesFromSkeleton). Copy the captured skeleton so the live one isn't
+    // mutated before the re-fill.
+    const moved = new Set(face.vertexIndices);
+    const vertices = skeleton.vertices.map((p, vi) => {
+      if (!moved.has(vi)) return [p[0], p[1], p[2]];
+      const q = [p[0], p[1], p[2]];
+      q[axis] = plane;
+      return q;
+    });
+    const modifiedSkeleton = { vertices, edges: skeleton.edges, faces: skeleton.faces };
 
-    // Moving the face from plane C to plane P sweeps, in each column (grid
-    // line ∥ the edit axis) the face touches, the cube-cells whose edit-axis
-    // least-corner lies in [min(C,P), max(C,P)-1]. XOR (toggle) the presence
-    // of every swept cell: this both adds cells the face vacated on one side
-    // and removes/re-adds as it crosses interior boundaries — the parity flips
-    // at each boundary automatically. The other two coordinates never change.
-    // Operate directly on the cube set, then recompute the skeleton once.
-    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
-    const kLo = Math.min(C, P);
-    const kHi = Math.max(C, P) - 1;
-
-    for (const c of quadCenters) {
-      // The quad center is at a cube center on the two in-plane axes, so its
-      // least-corner there is center - 0.5 (an integer).
-      const fixed = [0, 0, 0];
-      fixed[ua] = Math.round(c[ua] - 0.5);
-      fixed[ub] = Math.round(c[ub] - 0.5);
-      for (let k = kLo; k <= kHi; k++) {
-        const cell = [fixed[0], fixed[1], fixed[2]];
-        cell[axis] = k;
-        const [x, y, z] = cell;
-        if (hasVoxel(x, y, z)) removeVoxelRaw(x, y, z);
-        else addVoxelRaw(x, y, z);
-      }
+    try {
+      const cubes = dropOutOfBounds(fillCubesFromSkeleton(modifiedSkeleton));
+      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+      updateBrinkSkeleton();
+      updateStatus(mode);
+    } catch (error) {
+      console.error('Face drag failed while re-filling from skeleton:', error);
+      updateBrinkSkeleton(); // resync render to the unchanged positions
     }
-
-    updateBrinkSkeleton();
-    updateStatus(mode);
   }
 
   function endDrag() {
