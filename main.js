@@ -754,8 +754,9 @@ async function main() {
   function applyLoadedState(state) {
     if (!state) return;
 
-    for (const { x, y, z } of [...positions]) removeVoxel(x, y, z);
-    for (const { x, y, z } of state.positions) addVoxel(x, y, z);
+    for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+    for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
+    updateBrinkSkeleton();
 
     const radio = [...renderModeInputs].find((input) => input.value === state.renderMode);
     if (radio) radio.checked = true;
